@@ -1,5 +1,5 @@
 [package]
-name = "stellar_net"
+name = "rust_net"
 version = "0.1.0"
 edition = "2024"
 
