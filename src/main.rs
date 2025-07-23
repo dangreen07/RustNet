@@ -2,7 +2,7 @@ use chrono::prelude::*;
 use hex::encode;
 use secp256k1::SecretKey;
 use sha2::{Digest, Sha256};
-use stellar_net::wallet::{SignableTransaction, Transaction, TransactionParticipant, Wallet};
+use rust_net::wallet::{SignableTransaction, Transaction, TransactionParticipant, Wallet};
 
 const NUM_ZERO_BYTES: usize = 2;
 
