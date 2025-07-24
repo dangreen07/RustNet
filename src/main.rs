@@ -18,17 +18,20 @@ fn main() {
     // Creating the genesis block
     let first_block = Block::mine([0u8; 32], vec![transaction], Utc::now());
 
-    let first_block = Block::decode(&first_block.encode());
-
-    println!("First Block: {first_block:?}");
     // Store the newly mined block in the on-system blockchain
-    // let chain: Db = open("rust_net_chain").unwrap();
-    // let _ = chain.insert(first_block.current_hash, first_block.encode());
+    let chain: Db = open("rust_net_chain").unwrap();
+    let _ = chain.insert(first_block.current_hash, first_block.encode());
 
-    // let block = chain.get(first_block.current_hash).unwrap().unwrap();
+    let block = chain
+        .get(first_block.current_hash)
+        .unwrap()
+        .unwrap()
+        .to_vec();
 
-    // println!("Read block data: {block:?}");
+    let read_block = Block::decode(&block);
 
-    // // Clean up as in testing
-    // let _ = chain.remove(first_block.current_hash);
+    println!("Read block data: {read_block:?}");
+
+    // Clean up as in testing
+    let _ = chain.remove(first_block.current_hash);
 }
