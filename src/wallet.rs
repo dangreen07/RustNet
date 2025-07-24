@@ -93,9 +93,36 @@ impl SignableTransaction {
         buffer.extend_from_slice(&vector_buffer);
     }
 
+    fn decode_participants(
+        data: &Vec<u8>,
+        current_index: &mut usize,
+    ) -> Vec<TransactionParticipant> {
+        const PARTICIPANT_SIZE: usize = 33 + 8;
+        let size: [u8; 4] = data[*current_index..(*current_index + 4)]
+            .try_into()
+            .unwrap();
+        let size: usize = u32::from_le_bytes(size).try_into().unwrap();
+        let num_participants = size / PARTICIPANT_SIZE;
+        *current_index += 4;
+        let mut participants: Vec<TransactionParticipant> = Vec::with_capacity(num_participants);
+        for _ in 0..num_participants {
+            let public_key: [u8; 33] = data[*current_index..(*current_index + 33)]
+                .try_into()
+                .unwrap();
+            *current_index += 33;
+            let amount: [u8; 8] = data[*current_index..(*current_index + 8)]
+                .try_into()
+                .unwrap();
+            *current_index += 8;
+            let amount: u64 = u64::from_le_bytes(amount).try_into().unwrap();
+            participants.push(TransactionParticipant::new(public_key, amount));
+        }
+        return participants;
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer: Vec<u8> = vec![];
-        // Getting the size of the input elements
+
         SignableTransaction::encode_participants(&self.inputs, &mut buffer);
         SignableTransaction::encode_participants(&self.outputs, &mut buffer);
 
@@ -103,13 +130,27 @@ impl SignableTransaction {
         buffer.extend_from_slice(&fee_bytes);
         return buffer;
     }
+
+    pub fn decode(data: &Vec<u8>) -> (SignableTransaction, usize) {
+        let mut current_index = 0;
+        // Input participants
+        let inputs = SignableTransaction::decode_participants(data, &mut current_index);
+        let outputs = SignableTransaction::decode_participants(data, &mut current_index);
+        let fee: [u8; 8] = data[current_index..(current_index + 8)].try_into().unwrap();
+        let fee: f64 = f64::from_le_bytes(fee).try_into().unwrap();
+        current_index += 8;
+        return (
+            SignableTransaction::new(inputs, outputs, fee),
+            current_index,
+        );
+    }
 }
 
 #[derive(Debug)]
 pub struct Transaction {
-    id: [u8; 32],
-    details: SignableTransaction,
-    signature: [u8; 64],
+    pub id: [u8; 32],
+    pub details: SignableTransaction,
+    pub signature: [u8; 64],
 }
 
 impl Transaction {
