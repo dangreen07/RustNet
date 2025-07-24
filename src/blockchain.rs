@@ -4,10 +4,14 @@ use sha2::{Digest, Sha256};
 
 use crate::wallet::{SignableTransaction, Transaction};
 
-const NUM_ZERO_BYTES: usize = 2;
+const HASH_TARGET: [u8; 32] = [
+    0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+];
 
 #[derive(Debug)]
 struct HashableBlock {
+    hashed_transactions: Option<[u8; 32]>,
     previous_hash: [u8; 32],
     transactions: Vec<Transaction>,
     timestamp: DateTime<Utc>,
@@ -21,11 +25,40 @@ impl HashableBlock {
         timestamp: DateTime<Utc>,
     ) -> HashableBlock {
         HashableBlock {
+            hashed_transactions: None,
             previous_hash,
             transactions,
             timestamp,
             nonce: 0,
         }
+    }
+
+    fn hash_transactions(&mut self) -> [u8; 32] {
+        let mut transactions_buffer: Vec<u8> = vec![];
+        for transaction in &self.transactions {
+            transactions_buffer.extend_from_slice(&transaction.encode());
+        }
+        let mut hashed_transactions = [0u8; 32];
+        let hashed_transactions_generic = Sha256::digest(transactions_buffer);
+        hashed_transactions.copy_from_slice(&hashed_transactions_generic);
+        self.hashed_transactions = Some(hashed_transactions);
+        return hashed_transactions;
+    }
+
+    fn create_hashable(&mut self) -> Vec<u8> {
+        let mut hashable: Vec<u8> = vec![];
+        hashable.extend_from_slice(&self.previous_hash);
+        if let Some(hashed_transactions) = &self.hashed_transactions {
+            hashable.extend_from_slice(hashed_transactions);
+        } else {
+            hashable.extend(self.hash_transactions());
+        }
+        let timestamp = self.timestamp.timestamp();
+        let timestamp: [u8; 8] = timestamp.to_le_bytes();
+        hashable.extend_from_slice(&timestamp);
+        let nonce: [u8; 8] = self.nonce.to_le_bytes();
+        hashable.extend_from_slice(&nonce);
+        return hashable;
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -84,6 +117,7 @@ impl HashableBlock {
         let nonce: [u8; 8] = data[current_index..(current_index + 8)].try_into().unwrap();
         let nonce: u64 = u64::from_le_bytes(nonce).try_into().unwrap();
         return HashableBlock {
+            hashed_transactions: None,
             previous_hash,
             transactions,
             timestamp,
@@ -106,19 +140,14 @@ impl Block {
     ) -> Block {
         let mut hashable_block = HashableBlock::new(previous_hash, transactions, timestamp);
         let current_hash;
-        let check_against = [0u8; NUM_ZERO_BYTES];
         loop {
-            let encoded_hashable_block = hashable_block.encode();
-            let hashed = Sha256::digest(encoded_hashable_block);
-            let mut check_slice = [0u8; NUM_ZERO_BYTES];
-            check_slice.copy_from_slice(&hashed[..NUM_ZERO_BYTES]);
-            if check_slice == check_against {
+            let encoded_hashable_block = hashable_block.create_hashable();
+            let hashed: [u8; 32] = Sha256::digest(encoded_hashable_block).try_into().unwrap();
+            if hashed <= HASH_TARGET {
                 // Found Hash
-                let mut full_slice = [0u8; 32];
-                full_slice.copy_from_slice(&hashed);
-                let hash_hex = encode(full_slice);
+                let hash_hex = encode(hashed);
                 println!("Found Hash: {hash_hex}");
-                current_hash = full_slice;
+                current_hash = hashed;
                 break;
             } else {
                 hashable_block.nonce += 1;
