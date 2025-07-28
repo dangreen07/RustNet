@@ -1,19 +1,18 @@
 use bip39::{Language, Mnemonic};
 use copypasta::{ClipboardContext, ClipboardProvider};
+use futures::channel::mpsc;
 use hex::{decode, encode};
-use iced::widget::text_input;
 use iced::{
     Alignment::Center,
     Length::Fill,
     Padding, Subscription, Task, time,
-    widget::{Button, Container, Text, button, column, container, row, stack, text},
+    widget::{Button, Container, Text, button, column, container, row, stack, text, text_input},
 };
-use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fs::File;
 use std::io::prelude::*;
 use std::time::{Duration, Instant};
-use std::{collections::HashSet, fs::File};
 
 use crate::networking::network_worker;
 use crate::wallet::Wallet;
@@ -32,14 +31,33 @@ struct ConfigData {
     public_key: String,
 }
 
+/// State dedicated to the wallet-setup flow (shows passphrase + copy feedback).
+#[derive(Default)]
+struct WalletSetupState {
+    /// Generated 24-word passphrase shown to the user during wallet creation.
+    passphrase: String,
+    /// When `Some`, the timestamp when "Copied!" overlay started.
+    copy_feedback: Option<Instant>,
+}
+
+/// State dedicated to the “All Peers” screen.
+#[derive(Default)]
+struct AllPeersState {
+    /// Known/validated peers.
+    peers: Vec<String>,
+    /// The node's own external multiaddress (if known).
+    self_addr: Option<String>,
+    /// The value currently typed in the “Add peer” input field.
+    input_value: String,
+}
+
 pub struct State {
     wallet: Option<Wallet>,
     selected_mode: Option<AppMode>,
-    passphrase: String,
     current_screen: Screen,
-    copy_feedback: Option<Instant>,
-    peers: HashSet<PeerId>,
-    input_value: String,
+    wallet_setup: WalletSetupState,
+    all_peers: AllPeersState,
+    network_tx: Option<mpsc::Sender<Message>>, // NEW: store networking sender locally
 }
 
 impl Default for State {
@@ -47,11 +65,10 @@ impl Default for State {
         let mut state = State {
             wallet: None,
             selected_mode: None,
-            passphrase: "".to_string(),
             current_screen: Screen::NoWallet,
-            copy_feedback: None,
-            peers: HashSet::new(),
-            input_value: "".to_string(),
+            wallet_setup: WalletSetupState::default(),
+            all_peers: AllPeersState::default(),
+            network_tx: None,
         };
 
         state.read_config();
@@ -85,6 +102,9 @@ pub enum Message {
     TextInputChanged(String),
     SubmitButtonPressed,
     NewPeer(String),
+    SelfAddress(String),
+    PeerValidated(String),
+    NetworkSender(mpsc::Sender<Message>), // NEW variant used when worker exposes sender
 }
 
 impl State {
@@ -109,27 +129,25 @@ impl State {
                 .width(Fill)
                 .align_x(Center);
 
-                let passphrase = Text::new(&self.passphrase)
+                let passphrase = Text::new(&self.wallet_setup.passphrase)
                     .wrapping(text::Wrapping::Word)
                     .width(Fill);
 
                 // Style the button to look like text
                 let passphrase_button = Button::new(passphrase)
                     .on_press(Message::CopyPassphrase)
-                    .style(|_theme, _status| {
-                        button::Style {
-                            background: None,
-                            border: iced::Border::default(),
-                            shadow: iced::Shadow::default(),
-                            text_color: iced::Color::from_rgb(1.0, 1.0, 1.0), // Blue text to indicate it's clickable
-                        }
+                    .style(|_theme, _status| button::Style {
+                        background: None,
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        text_color: iced::Color::from_rgb(1.0, 1.0, 1.0),
                     });
 
                 // Create a stack with the passphrase button and overlay the copy feedback
                 let mut passphrase_stack = stack![passphrase_button];
 
                 // Add copy feedback overlay if active
-                if let Some(copy_time) = self.copy_feedback {
+                if let Some(copy_time) = self.wallet_setup.copy_feedback {
                     if copy_time.elapsed() < Duration::from_secs(2) {
                         let feedback =
                             container(text("Copied!").size(14).color(iced::Color::WHITE))
@@ -219,16 +237,33 @@ impl State {
             Screen::AllPeers => {
                 let title = text("All Peers").size(50);
 
+                // Show our own address if available
+                let mut content = column![title];
+                if let Some(addr) = &self.all_peers.self_addr {
+                    content = content.push(text(format!("Your address: {addr}")));
+                }
+
                 // Bind the current input value so the field reflects user edits
-                let new_peer_input =
-                    text_input("Enter the Peer's Multi-Address", &self.input_value)
-                        .on_input(|value| Message::TextInputChanged(value));
+                let new_peer_input = text_input(
+                    "Enter the Peer's Multi-Address",
+                    &self.all_peers.input_value,
+                )
+                .on_input(|value| Message::TextInputChanged(value));
 
                 let new_peer_button = button("Add New Peer").on_press(Message::SubmitButtonPressed);
 
-                let interface =
-                    container(column![title, new_peer_input, new_peer_button].spacing(5))
-                        .padding(15);
+                let mut peers_list = column![];
+
+                for addr in &self.all_peers.peers {
+                    peers_list = peers_list.push(text(addr));
+                }
+
+                content = content
+                    .push(new_peer_input)
+                    .push(new_peer_button)
+                    .push(peers_list);
+
+                let interface = container(content.spacing(5)).padding(15);
                 interface
             }
         }
@@ -240,7 +275,7 @@ impl State {
                 let mut rng = bip39::rand::thread_rng();
                 let m = Mnemonic::generate_in_with(&mut rng, Language::English, 24).unwrap();
                 let passphrase = m.to_string();
-                self.passphrase = passphrase.clone();
+                self.wallet_setup.passphrase = passphrase.clone();
                 let wallet = Wallet::new(passphrase);
                 self.wallet = Some(wallet);
 
@@ -248,8 +283,9 @@ impl State {
             }
             Message::CopyPassphrase => {
                 let mut ctx = ClipboardContext::new().unwrap();
-                ctx.set_contents(self.passphrase.to_owned()).unwrap();
-                self.copy_feedback = Some(Instant::now());
+                ctx.set_contents(self.wallet_setup.passphrase.to_owned())
+                    .unwrap();
+                self.wallet_setup.copy_feedback = Some(Instant::now());
 
                 // Set up a task to hide the feedback after 2 seconds
                 return Task::perform(
@@ -260,13 +296,13 @@ impl State {
                 );
             }
             Message::HideCopyFeedback => {
-                self.copy_feedback = None;
+                self.wallet_setup.copy_feedback = None;
             }
             Message::Tick => {
                 // Check if we need to hide the copy feedback
-                if let Some(copy_time) = self.copy_feedback {
+                if let Some(copy_time) = self.wallet_setup.copy_feedback {
                     if copy_time.elapsed() >= Duration::from_secs(2) {
-                        self.copy_feedback = None;
+                        self.wallet_setup.copy_feedback = None;
                     }
                 }
             }
@@ -292,33 +328,38 @@ impl State {
                 self.current_screen = Screen::AllPeers;
             }
             Message::TextInputChanged(value) => {
-                self.input_value = value;
+                self.all_peers.input_value = value;
             }
             Message::SubmitButtonPressed => {
-                // Once networking wiring is in place, this is where the new peer
-                // will be forwarded. For now, we simply log the peer address and
-                // clear the input so the UI feels responsive.
-
-                if !self.input_value.trim().is_empty() {
-                    // Clear the UI input field.
-                    let input_value = self.input_value.clone();
-                    self.input_value.clear();
-                    return Task::done(Message::NewPeer(input_value.to_string()));
+                if !self.all_peers.input_value.trim().is_empty() {
+                    let input_value = self.all_peers.input_value.clone();
+                    self.all_peers.input_value.clear();
+                    // Immediately show it in the list as pending/optimistic
+                    // feedback; networking will confirm later.
+                    if !self.all_peers.peers.contains(&input_value) {
+                        self.all_peers.peers.push(input_value.clone());
+                    }
+                    return Task::done(Message::NewPeer(input_value));
                 }
             }
             Message::NewPeer(addr) => {
                 // Forward the new peer address to the networking task (if the
                 // networking task has already exposed its sender).
-                if let Some(mut tx) = crate::networking::get_network_sender() {
-                    // Best-effort send – ignore error if the receiver has been
-                    // dropped (e.g. networking task not running yet).
+                if let Some(tx) = &mut self.network_tx {
                     let _ = tx.try_send(Message::NewPeer(addr.clone()));
                 }
-
-                // Optionally keep track of peers locally too.
-                if let Ok(peer_id) = addr.parse() {
-                    self.peers.insert(peer_id);
+            }
+            Message::PeerValidated(addr) => {
+                if !self.all_peers.peers.contains(&addr) {
+                    self.all_peers.peers.push(addr);
                 }
+            }
+            Message::SelfAddress(addr) => {
+                self.all_peers.self_addr = Some(addr);
+            }
+            Message::NetworkSender(sender) => {
+                // Store the networking sender for subsequent use
+                self.network_tx = Some(sender);
             }
         }
         Task::none()
@@ -377,14 +418,14 @@ impl State {
     }
 
     pub fn time_subscription(&self) -> Subscription<Message> {
-        let num_peers = self.peers.len();
-        if self.copy_feedback.is_some() {
+        let num_peers = self.all_peers.peers.len();
+        if self.wallet_setup.copy_feedback.is_some() {
             return time::every(Duration::from_millis(100)).map(move |_| {
                 println!("Peers: {num_peers}");
                 return Message::Tick;
             });
         }
-        if num_peers == 0 {
+        if num_peers == 0 && self.selected_mode.is_some() {
             return time::every(Duration::from_millis(5)).map(move |_| {
                 return Message::NoPeers;
             });
