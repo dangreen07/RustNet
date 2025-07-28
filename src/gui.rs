@@ -39,6 +39,8 @@ struct WalletSetupState {
     passphrase: String,
     /// When `Some`, the timestamp when "Copied!" overlay started.
     copy_feedback: Option<Instant>,
+    /// When `Some`, the timestamp when "Copy failed" overlay started.
+    copy_failed_feedback: Option<Instant>,
 }
 
 /// State dedicated to the “All Peers” screen.
@@ -58,7 +60,7 @@ pub struct State {
     current_screen: Screen,
     wallet_setup: WalletSetupState,
     all_peers: AllPeersState,
-    network_tx: Option<mpsc::Sender<Message>>, // NEW: store networking sender locally
+    network_tx: Option<mpsc::Sender<Message>>,
 }
 
 impl Default for State {
@@ -67,7 +69,11 @@ impl Default for State {
             wallet: None,
             selected_mode: None,
             current_screen: Screen::NoWallet,
-            wallet_setup: WalletSetupState::default(),
+            wallet_setup: WalletSetupState {
+                passphrase: "".to_string(),
+                copy_feedback: None,
+                copy_failed_feedback: None,
+            },
             all_peers: AllPeersState::default(),
             network_tx: None,
         };
@@ -93,6 +99,7 @@ enum Screen {
 pub enum Message {
     CreateWallet,
     CopyPassphrase,
+    CopyFailed,
     HideCopyFeedback,
     Tick,
     ConfirmPassphraseStored,
@@ -290,11 +297,29 @@ impl State {
                 self.current_screen = Screen::WalletCreated;
             }
             Message::CopyPassphrase => {
-                let mut ctx = ClipboardContext::new().unwrap();
-                ctx.set_contents(self.wallet_setup.passphrase.to_owned())
-                    .unwrap();
-                self.wallet_setup.copy_feedback = Some(Instant::now());
+                if let Ok(mut ctx) = ClipboardContext::new() {
+                    if ctx
+                        .set_contents(self.wallet_setup.passphrase.to_owned())
+                        .is_ok()
+                    {
+                        self.wallet_setup.copy_feedback = Some(Instant::now());
+                    } else {
+                        return Task::perform(async {}, |_| Message::CopyFailed);
+                    }
+                } else {
+                    return Task::perform(async {}, |_| Message::CopyFailed);
+                }
 
+                // Set up a task to hide the feedback after 2 seconds
+                return Task::perform(
+                    async {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    },
+                    |_| Message::HideCopyFeedback,
+                );
+            }
+            Message::CopyFailed => {
+                self.wallet_setup.copy_failed_feedback = Some(Instant::now());
                 // Set up a task to hide the feedback after 2 seconds
                 return Task::perform(
                     async {
@@ -305,6 +330,7 @@ impl State {
             }
             Message::HideCopyFeedback => {
                 self.wallet_setup.copy_feedback = None;
+                self.wallet_setup.copy_failed_feedback = None;
             }
             Message::Tick => {
                 // Check if we need to hide the copy feedback
