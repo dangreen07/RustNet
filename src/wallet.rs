@@ -175,6 +175,25 @@ impl Transaction {
         };
     }
 
+    pub fn new_coin(signable: SignableTransaction) -> Transaction {
+        let transaction_bytes = signable.encode();
+        let transaction_hashed_generic = Sha256::digest(transaction_bytes.clone());
+        let mut transaction_hashed = [0u8; 32];
+        transaction_hashed.copy_from_slice(&transaction_hashed_generic);
+        let mut id_buffer: Vec<u8> = vec![];
+        id_buffer.extend_from_slice(&transaction_bytes);
+        let signature = [0u8; 64];
+        id_buffer.extend_from_slice(&signature);
+        let id_generic = Sha256::digest(id_buffer);
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&id_generic);
+        return Transaction {
+            id: id,
+            details: signable,
+            signature: signature,
+        };
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer: Vec<u8> = vec![];
         buffer.extend_from_slice(&self.id);

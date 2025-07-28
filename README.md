@@ -5,7 +5,8 @@ RustNet is a simple blockchain system written in rust. The goal of this blockcha
 - Wallet Creation
 - Transaction Creation
 - Block Hashing (Mining with Proof of Work)
+- Networking
 
 ## Upcoming Feature's
-- Networking
+- Ability for peers to exchange useful information
 - Difficulty Modification

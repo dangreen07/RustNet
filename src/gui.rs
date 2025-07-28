@@ -4,8 +4,9 @@ use futures::channel::mpsc;
 use hex::{decode, encode};
 use iced::{
     Alignment::Center,
-    Length::Fill,
-    Padding, Subscription, Task, time,
+    Background, Border, Color,
+    Length::{self, Fill},
+    Padding, Renderer, Subscription, Task, Theme, alignment, time,
     widget::{Button, Container, Text, button, column, container, row, stack, text, text_input},
 };
 use serde::{Deserialize, Serialize};
@@ -14,10 +15,10 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::time::{Duration, Instant};
 
-use crate::networking::network_worker;
 use crate::wallet::Wallet;
+use crate::{blockchain::Storage, networking::network_worker};
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 enum AppMode {
     Wallet,
     Node,
@@ -61,10 +62,13 @@ pub struct State {
     wallet_setup: WalletSetupState,
     all_peers: AllPeersState,
     network_tx: Option<mpsc::Sender<Message>>,
+    blockchain: Storage,
 }
 
 impl Default for State {
     fn default() -> Self {
+        let chain = Storage::new("rust_net_chain".to_string());
+
         let mut state = State {
             wallet: None,
             selected_mode: None,
@@ -76,6 +80,7 @@ impl Default for State {
             },
             all_peers: AllPeersState::default(),
             network_tx: None,
+            blockchain: chain,
         };
 
         state.read_config();
@@ -114,11 +119,63 @@ pub enum Message {
     PeerValidated(String),
     NetworkSender(mpsc::Sender<Message>),
     GotoMain,
+    GoToWalletInfo,
+    GoToNodeSync,
+    GoToMinerMonitoring,
+    GoToAllPeers,
 }
 
 impl State {
+    fn sidebar(&self) -> Container<Message> {
+        let mut buttons = column![].spacing(10);
+
+        if let Some(mode) = self.selected_mode {
+            let wallet_button = button(
+                container(text("Wallet Info"))
+                    .width(Length::Fill)
+                    .align_x(alignment::Horizontal::Center),
+            )
+            .on_press(Message::GoToWalletInfo)
+            .width(Length::Fill);
+            buttons = buttons.push(wallet_button);
+
+            if matches!(mode, AppMode::Node | AppMode::Miner) {
+                let node_button = button(
+                    container(text("Node Sync"))
+                        .width(Length::Fill)
+                        .align_x(alignment::Horizontal::Center),
+                )
+                .on_press(Message::GoToNodeSync)
+                .width(Length::Fill);
+                buttons = buttons.push(node_button);
+            }
+
+            if matches!(mode, AppMode::Miner) {
+                let miner_button = button(
+                    container(text("Miner Monitoring"))
+                        .width(Length::Fill)
+                        .align_x(alignment::Horizontal::Center),
+                )
+                .on_press(Message::GoToMinerMonitoring)
+                .width(Length::Fill);
+                buttons = buttons.push(miner_button);
+            }
+
+            let peers_button = button(
+                container(text("All Peers"))
+                    .width(Length::Fill)
+                    .align_x(alignment::Horizontal::Center),
+            )
+            .on_press(Message::GoToAllPeers)
+            .width(Length::Fill);
+            buttons = buttons.push(peers_button);
+        }
+
+        container(buttons).padding(15).width(Length::Fixed(200.0))
+    }
+
     pub fn view(&self) -> Container<Message> {
-        match self.current_screen {
+        let content = match self.current_screen {
             Screen::NoWallet => {
                 // The buttons
                 let create_wallet = button("Create Wallet").on_press(Message::CreateWallet);
@@ -138,18 +195,18 @@ impl State {
                 .width(Fill)
                 .align_x(Center);
 
-                let passphrase = Text::new(&self.wallet_setup.passphrase)
+                let passphrase: Text<Theme, Renderer> = text(&self.wallet_setup.passphrase)
                     .wrapping(text::Wrapping::Word)
                     .width(Fill);
 
                 // Style the button to look like text
                 let passphrase_button = Button::new(passphrase)
                     .on_press(Message::CopyPassphrase)
-                    .style(|_theme, _status| button::Style {
+                    .style(|theme, _status| button::Style {
                         background: None,
                         border: iced::Border::default(),
                         shadow: iced::Shadow::default(),
-                        text_color: iced::Color::from_rgb(1.0, 1.0, 1.0),
+                        text_color: theme.palette().text,
                     });
 
                 // Create a stack with the passphrase button and overlay the copy feedback
@@ -163,6 +220,34 @@ impl State {
                                 .style(|_theme| container::Style {
                                     background: Some(iced::Background::Color(
                                         iced::Color::from_rgba(0.2, 0.2, 0.2, 0.9),
+                                    )),
+                                    text_color: Some(iced::Color::WHITE),
+                                    border: iced::Border {
+                                        radius: 6.0.into(),
+                                        ..Default::default()
+                                    },
+                                    shadow: iced::Shadow {
+                                        color: iced::Color::BLACK,
+                                        offset: iced::Vector::new(0.0, 2.0),
+                                        blur_radius: 4.0,
+                                    },
+                                    ..Default::default()
+                                })
+                                .padding(8)
+                                .center_x(Fill)
+                                .center_y(Fill);
+
+                        passphrase_stack = passphrase_stack.push(feedback);
+                    }
+                }
+
+                if let Some(copy_time) = self.wallet_setup.copy_failed_feedback {
+                    if copy_time.elapsed() < Duration::from_secs(2) {
+                        let feedback =
+                            container(text("Copy failed").size(14).color(iced::Color::WHITE))
+                                .style(|_theme| container::Style {
+                                    background: Some(iced::Background::Color(
+                                        iced::Color::from_rgba(0.8, 0.2, 0.2, 0.9),
                                     )),
                                     text_color: Some(iced::Color::WHITE),
                                     border: iced::Border {
@@ -230,12 +315,39 @@ impl State {
             }
             Screen::WalletInfo => {
                 let title = text("Wallet Info").size(50);
-                let interface = container(column![title]).padding(15);
+                let mut content = column![title];
+
+                let coins_label = text("Funds: ").size(30);
+                let coins = text("0.00").size(30);
+                content = content.push(row![coins_label, coins]);
+
+                let send = button("Send");
+                if let Some(wallet) = &self.wallet {
+                    let public_address = text_input("", &encode(wallet.public_key)).style(
+                        |theme: &Theme, _status| text_input::Style {
+                            background: Background::Color(Color::TRANSPARENT),
+                            border: Border::default(),
+                            icon: Color::TRANSPARENT,
+                            placeholder: theme.palette().text,
+                            value: theme.palette().text,
+                            selection: theme.palette().primary,
+                        },
+                    );
+                    content = content.push(public_address);
+                }
+                content = content.push(send);
+
+                let interface = container(content.spacing(5)).padding(15);
                 interface
             }
             Screen::NodeSync => {
                 let title = text("Node Sync").size(50);
-                let interface = container(column![title]).padding(15);
+
+                let block_height_text = text("Block Height: ").size(30);
+                let block_height = text(self.blockchain.get_best_height()).size(30);
+                let block_row = row![block_height_text, block_height];
+
+                let interface = container(column![title, block_row].spacing(5)).padding(15);
                 interface
             }
             Screen::MinerMonitoring => {
@@ -267,8 +379,6 @@ impl State {
                     peers_list = peers_list.push(text(addr));
                 }
 
-                let leave_button = button("Done").on_press(Message::GotoMain);
-
                 content = content
                     .push(new_peer_input)
                     .push(new_peer_button)
@@ -276,11 +386,22 @@ impl State {
                     .height(Fill)
                     .spacing(5);
 
-                let content = column![content, column![leave_button].width(Fill).align_x(Center)];
+                let content = column![content];
 
                 let interface = container(content.spacing(5)).padding(15);
                 interface
             }
+        };
+
+        if self.selected_mode.is_some()
+            && !matches!(
+                self.current_screen,
+                Screen::NoWallet | Screen::WalletCreated | Screen::SelectOption
+            )
+        {
+            container(row![self.sidebar(), content])
+        } else {
+            content
         }
     }
 
@@ -400,6 +521,21 @@ impl State {
                     }
                 }
             }
+            Message::GoToWalletInfo => {
+                self.current_screen = Screen::WalletInfo;
+            }
+            Message::GoToNodeSync => {
+                self.current_screen = Screen::NodeSync;
+            }
+            Message::GoToMinerMonitoring => {
+                self.current_screen = Screen::MinerMonitoring;
+            }
+            Message::GoToAllPeers => {
+                self.current_screen = Screen::AllPeers;
+            }
+        }
+        if self.all_peers.peers.len() == 0 && self.selected_mode.is_some() {
+            return Task::done(Message::NoPeers);
         }
         Task::none()
     }
@@ -459,17 +595,8 @@ impl State {
     }
 
     pub fn time_subscription(&self) -> Subscription<Message> {
-        let num_peers = self.all_peers.peers.len();
         if self.wallet_setup.copy_feedback.is_some() {
-            return time::every(Duration::from_millis(100)).map(move |_| {
-                println!("Peers: {num_peers}");
-                return Message::Tick;
-            });
-        }
-        if num_peers == 0 && self.selected_mode.is_some() {
-            return time::every(Duration::from_millis(5)).map(move |_| {
-                return Message::NoPeers;
-            });
+            return time::every(Duration::from_millis(100)).map(move |_| Message::Tick);
         }
         Subscription::none()
     }
