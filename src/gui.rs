@@ -29,6 +29,7 @@ struct ConfigData {
     app_mode: AppMode,
     private_key: String,
     public_key: String,
+    discovered_peers: Vec<String>,
 }
 
 /// State dedicated to the wallet-setup flow (shows passphrase + copy feedback).
@@ -104,7 +105,8 @@ pub enum Message {
     NewPeer(String),
     SelfAddress(String),
     PeerValidated(String),
-    NetworkSender(mpsc::Sender<Message>), // NEW variant used when worker exposes sender
+    NetworkSender(mpsc::Sender<Message>),
+    GotoMain,
 }
 
 impl State {
@@ -258,10 +260,16 @@ impl State {
                     peers_list = peers_list.push(text(addr));
                 }
 
+                let leave_button = button("Done").on_press(Message::GotoMain);
+
                 content = content
                     .push(new_peer_input)
                     .push(new_peer_button)
-                    .push(peers_list);
+                    .push(peers_list)
+                    .height(Fill)
+                    .spacing(5);
+
+                let content = column![content, column![leave_button].width(Fill).align_x(Center)];
 
                 let interface = container(content.spacing(5)).padding(15);
                 interface
@@ -334,11 +342,6 @@ impl State {
                 if !self.all_peers.input_value.trim().is_empty() {
                     let input_value = self.all_peers.input_value.clone();
                     self.all_peers.input_value.clear();
-                    // Immediately show it in the list as pending/optimistic
-                    // feedback; networking will confirm later.
-                    if !self.all_peers.peers.contains(&input_value) {
-                        self.all_peers.peers.push(input_value.clone());
-                    }
                     return Task::done(Message::NewPeer(input_value));
                 }
             }
@@ -352,6 +355,7 @@ impl State {
             Message::PeerValidated(addr) => {
                 if !self.all_peers.peers.contains(&addr) {
                     self.all_peers.peers.push(addr);
+                    self.save_config();
                 }
             }
             Message::SelfAddress(addr) => {
@@ -360,6 +364,15 @@ impl State {
             Message::NetworkSender(sender) => {
                 // Store the networking sender for subsequent use
                 self.network_tx = Some(sender);
+            }
+            Message::GotoMain => {
+                if let Some(selected_mode) = self.selected_mode {
+                    match selected_mode {
+                        AppMode::Wallet => self.current_screen = Screen::WalletInfo,
+                        AppMode::Node => self.current_screen = Screen::NodeSync,
+                        AppMode::Miner => self.current_screen = Screen::MinerMonitoring,
+                    }
+                }
             }
         }
         Task::none()
@@ -374,6 +387,7 @@ impl State {
                     app_mode: selected_mode.clone(),
                     public_key,
                     private_key,
+                    discovered_peers: self.all_peers.peers.clone(),
                 };
                 let config = json!(config).to_string();
                 let mut config_file = File::create("config.json").unwrap();
@@ -415,6 +429,7 @@ impl State {
                 self.current_screen = Screen::MinerMonitoring;
             }
         }
+        self.all_peers.peers = config.discovered_peers;
     }
 
     pub fn time_subscription(&self) -> Subscription<Message> {

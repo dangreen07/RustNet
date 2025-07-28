@@ -148,8 +148,28 @@ pub fn network_worker() -> impl Stream<Item = Message> {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             println!("Connection established with peer {peer_id}");
+
+                            // Determine the remote multi-address that the connection was
+                            // established on (handles both dialer and listener cases).
+                            let remote_addr = match &endpoint {
+                                libp2p::core::ConnectedPoint::Dialer { address, .. } => address.clone(),
+                                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.clone(),
+                            };
+
+                            // Ensure the multiaddr includes the peer id component so it can be
+                            // parsed directly by callers expecting `/p2p/<peerId>` to be present.
+                            let mut addr_with_peer = remote_addr.clone();
+                            if !addr_with_peer.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+                                addr_with_peer.push(Protocol::P2p(peer_id.into()));
+                            }
+
+                            // Inform the GUI that this peer has been successfully validated.
+                            output
+                                .send(Message::PeerValidated(addr_with_peer.to_string()))
+                                .await
+                                .ok();
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             eprintln!("Failed to dial peer {peer_id:?}: {error}");
