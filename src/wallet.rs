@@ -50,12 +50,22 @@ impl fmt::Debug for Wallet {
 #[derive(Clone, Copy, Debug)]
 pub struct TransactionParticipant {
     public_key: [u8; 33],
-    amount: u64,
+    amount: f64,
 }
 
 impl TransactionParticipant {
-    pub fn new(public_key: [u8; 33], amount: u64) -> TransactionParticipant {
+    pub fn new(public_key: [u8; 33], amount: f64) -> TransactionParticipant {
         TransactionParticipant { public_key, amount }
+    }
+
+    /// Returns the participant's public key.
+    pub fn public_key(&self) -> [u8; 33] {
+        self.public_key
+    }
+
+    /// Returns the amount associated with this participant.
+    pub fn amount(&self) -> f64 {
+        self.amount
     }
 }
 
@@ -77,6 +87,16 @@ impl SignableTransaction {
             outputs: outputs,
             fee: fee,
         }
+    }
+
+    /// Returns a slice of input participants.
+    pub fn inputs(&self) -> &[TransactionParticipant] {
+        &self.inputs
+    }
+
+    /// Returns a slice of output participants.
+    pub fn outputs(&self) -> &[TransactionParticipant] {
+        &self.outputs
     }
 
     fn encode_participants(vector: &[TransactionParticipant], buffer: &mut Vec<u8>) {
@@ -114,7 +134,7 @@ impl SignableTransaction {
                 .try_into()
                 .unwrap();
             *current_index += 8;
-            let amount: u64 = u64::from_le_bytes(amount).try_into().unwrap();
+            let amount: f64 = f64::from_le_bytes(amount).try_into().unwrap();
             participants.push(TransactionParticipant::new(public_key, amount));
         }
         return participants;

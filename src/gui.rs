@@ -10,13 +10,13 @@ use iced::{
     widget::{Button, Container, Text, button, column, container, row, stack, text, text_input},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::fs::File;
 use std::io::prelude::*;
 use std::time::{Duration, Instant};
 
+use crate::blockchain::Storage;
+use crate::networking::{full_node_network_worker, wallet_network_worker};
 use crate::wallet::Wallet;
-use crate::{blockchain::Storage, networking::network_worker};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 enum AppMode {
@@ -61,6 +61,11 @@ pub struct State {
     current_screen: Screen,
     wallet_setup: WalletSetupState,
     all_peers: AllPeersState,
+    /// Peers loaded from configuration that must be validated on startup before
+    /// being persisted again. These are dialed once the networking subsystem
+    /// exposes its sender, and only peers that successfully connect will be
+    /// added back to `all_peers.peers`.
+    boot_peers: Vec<String>,
     network_tx: Option<mpsc::Sender<Message>>,
     blockchain: Storage,
 }
@@ -79,11 +84,15 @@ impl Default for State {
                 copy_failed_feedback: None,
             },
             all_peers: AllPeersState::default(),
+            boot_peers: Vec::new(),
             network_tx: None,
             blockchain: chain,
         };
 
         state.read_config();
+
+        // Debug: print the current blockchain to console for inspection.
+        state.blockchain.print_chain();
 
         state
     }
@@ -318,7 +327,13 @@ impl State {
                 let mut content = column![title];
 
                 let coins_label = text("Funds: ").size(30);
-                let coins = text("0.00").size(30);
+                let coins_value = if let Some(wallet) = &self.wallet {
+                    let bal = self.blockchain.balance(wallet.public_key);
+                    format!("{bal:.2}")
+                } else {
+                    "0".to_string()
+                };
+                let coins = text(coins_value).size(30);
                 content = content.push(row![coins_label, coins]);
 
                 let send = button("Send");
@@ -344,7 +359,8 @@ impl State {
                 let title = text("Node Sync").size(50);
 
                 let block_height_text = text("Block Height: ").size(30);
-                let block_height = text(self.blockchain.get_best_height()).size(30);
+                let height = self.blockchain.get_best_height().unwrap_or(0);
+                let block_height = text(height).size(30);
                 let block_row = row![block_height_text, block_height];
 
                 let interface = container(column![title, block_row].spacing(5)).padding(15);
@@ -500,7 +516,19 @@ impl State {
                 }
             }
             Message::PeerValidated(addr) => {
-                if !self.all_peers.peers.contains(&addr) {
+                // Extract peer id component (string after last "/p2p/") to
+                // deduplicate peers regardless of the address/port they were
+                // seen on.
+                let peer_id_part = addr.rsplit_once("/p2p/").map(|(_, id)| id);
+
+                let duplicate = match peer_id_part {
+                    Some(id) => self.all_peers.peers.iter().any(|existing| {
+                        existing.rsplit_once("/p2p/").map(|(_, eid)| eid) == Some(id)
+                    }),
+                    None => self.all_peers.peers.contains(&addr),
+                };
+
+                if !duplicate {
                     self.all_peers.peers.push(addr);
                     self.save_config();
                 }
@@ -509,8 +537,25 @@ impl State {
                 self.all_peers.self_addr = Some(addr);
             }
             Message::NetworkSender(sender) => {
-                // Store the networking sender for subsequent use
-                self.network_tx = Some(sender);
+                // Store the networking sender for subsequent use.
+                self.network_tx = Some(sender.clone());
+
+                // Validate peers loaded from previous sessions. Dial each of
+                // them; successful connections will trigger `PeerValidated`,
+                // which will add them back to the main peers list and persist
+                // them. Peers that fail to connect will be discarded.
+                if !self.boot_peers.is_empty() {
+                    if let Some(tx) = &mut self.network_tx {
+                        for addr in self.boot_peers.iter().cloned() {
+                            let _ = tx.try_send(Message::NewPeer(addr));
+                        }
+                    }
+
+                    // Clear the pending list and persist an empty peers list;
+                    // validated peers will be saved again as they succeed.
+                    self.boot_peers.clear();
+                    self.save_config();
+                }
             }
             Message::GotoMain => {
                 if let Some(selected_mode) = self.selected_mode {
@@ -543,17 +588,21 @@ impl State {
     fn save_config(&self) {
         if let Some(selected_mode) = &self.selected_mode {
             if let Some(wallet) = &self.wallet {
-                let private_key = encode(wallet.private_key);
-                let public_key = encode(wallet.public_key);
-                let config = ConfigData {
-                    app_mode: selected_mode.clone(),
-                    public_key,
-                    private_key,
-                    discovered_peers: self.all_peers.peers.clone(),
-                };
-                let config = json!(config).to_string();
+                // Load existing config to preserve fields we don't manage (e.g., node_private_key)
+                let mut cfg_value: serde_json::Value = std::fs::read_to_string("config.json")
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                cfg_value["app_mode"] = serde_json::to_value(selected_mode).unwrap();
+                cfg_value["public_key"] = serde_json::Value::String(encode(wallet.public_key));
+                cfg_value["private_key"] = serde_json::Value::String(encode(wallet.private_key));
+                cfg_value["discovered_peers"] =
+                    serde_json::to_value(&self.all_peers.peers).unwrap();
+
+                let serialized = serde_json::to_string(&cfg_value).unwrap();
                 let mut config_file = File::create("config.json").unwrap();
-                config_file.write_all(config.as_bytes()).unwrap();
+                config_file.write_all(serialized.as_bytes()).unwrap();
             }
         }
     }
@@ -591,7 +640,11 @@ impl State {
                 self.current_screen = Screen::MinerMonitoring;
             }
         }
-        self.all_peers.peers = config.discovered_peers;
+        // Defer peer validation until the networking layer is ready. We will
+        // attempt to dial each stored peer once we obtain the networking
+        // channel; only peers that successfully connect will be re-added and
+        // persisted.
+        self.boot_peers = config.discovered_peers;
     }
 
     pub fn time_subscription(&self) -> Subscription<Message> {
@@ -602,6 +655,10 @@ impl State {
     }
 
     pub fn networking_subscription(&self) -> Subscription<Message> {
-        Subscription::run(network_worker)
+        if matches!(self.selected_mode, Some(AppMode::Node | AppMode::Miner)) {
+            Subscription::run(full_node_network_worker)
+        } else {
+            Subscription::run(wallet_network_worker)
+        }
     }
 }

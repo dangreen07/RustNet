@@ -1,4 +1,8 @@
+use hex::{decode as hex_decode, encode as hex_encode};
+use libp2p::identity::{self, Keypair};
 use libp2p::multiaddr::Protocol;
+use serde_json::Value;
+use std::fs;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -61,12 +65,47 @@ struct MyBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
-    // If you use `with_relay_client()`:
-    // relay: libp2p::relay::client::Behaviour,
 }
 
-pub fn network_worker() -> impl Stream<Item = Message> {
-    stream::channel(100, |mut output| async move {
+fn load_or_generate_identity() -> Keypair {
+    // Attempt to read `node_private_key` from config.json
+    let mut cfg_value: Value = fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()));
+
+    if let Some(key_hex) = cfg_value.get("node_private_key").and_then(|v| v.as_str()) {
+        if let Ok(bytes) = hex_decode(key_hex) {
+            if let Ok(kp) = identity::Keypair::from_protobuf_encoding(&bytes) {
+                return kp;
+            }
+        }
+    }
+
+    // Generate new keypair and store it in the config.
+    let kp = identity::Keypair::generate_ed25519();
+    if let Ok(bytes) = kp.to_protobuf_encoding() {
+        let key_hex = hex_encode(bytes);
+        cfg_value["node_private_key"] = Value::String(key_hex);
+
+        // Write back the updated config (ignore errors – worst case we generate again).
+        if let Ok(serialized) = serde_json::to_string(&cfg_value) {
+            let _ = fs::write("config.json", serialized);
+        }
+    }
+    kp
+}
+
+pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
+    // Ensure a stable identity.
+    let id_keys = load_or_generate_identity();
+
+    stream::channel(100, move |mut output| async move {
+        use std::collections::HashSet;
+
+        let mut dialed_addrs: HashSet<String> = HashSet::new();
+        let mut bootstrap_done = false;
+
         // Create channel that external components can use to talk to the
         // networking task.
         let (sender, receiver) = mpsc::channel::<Message>(100);
@@ -77,7 +116,7 @@ pub fn network_worker() -> impl Stream<Item = Message> {
             .await
             .ok();
 
-        let mut swarm = SwarmBuilder::with_new_identity()
+        let mut swarm = SwarmBuilder::with_existing_identity(id_keys)
             .with_tokio()
             .with_tcp(
                 Default::default(),
@@ -85,7 +124,7 @@ pub fn network_worker() -> impl Stream<Item = Message> {
                 libp2p::yamux::Config::default,
             )
             .unwrap()
-            .with_behaviour(|local_key_pair| {
+            .with_behaviour(move |local_key_pair| {
                 let local_peer_id = PeerId::from(local_key_pair.public());
 
                 // 1. Kademlia setup
@@ -95,14 +134,20 @@ pub fn network_worker() -> impl Stream<Item = Message> {
                 );
 
                 // 2. Identify setup (crucial for Kademlia to work well)
-                // Identify shares your node's public addresses and supported protocols
-                let identify = identify::Behaviour::new(
-                    identify::Config::new(
-                        "/rustnet/0.1.0".to_string(), // Standard identify protocol version
-                        local_key_pair.public(),      // Your local public key
-                    )
-                    .with_interval(Duration::from_secs(300)), // Periodically identify
-                );
+                // Embed the node role in the agent version so peers can distinguish
+                // between wallet-only nodes and full nodes.
+                let agent_version = if is_full_node {
+                    "rustnet-fullnode"
+                } else {
+                    "rustnet-wallet"
+                };
+
+                let identify_cfg =
+                    identify::Config::new("/rustnet/0.1.0".to_string(), local_key_pair.public())
+                        .with_agent_version(agent_version.to_string())
+                        .with_interval(Duration::from_secs(300));
+
+                let identify = identify::Behaviour::new(identify_cfg);
 
                 // 3. Ping setup (optional, for connection health)
                 let ping = ping::Behaviour::new(ping::Config::new());
@@ -165,6 +210,17 @@ pub fn network_worker() -> impl Stream<Item = Message> {
                                 addr_with_peer.push(Protocol::P2p(peer_id.into()));
                             }
 
+                            // Feed address to Kademlia and trigger a bootstrap in order to
+                            // discover further peers automatically.
+                            {
+                                let behaviour = swarm.get_mut().behaviour_mut();
+                                behaviour.kademlia.add_address(&peer_id, remote_addr.clone());
+                                if !bootstrap_done {
+                                    let _ = behaviour.kademlia.bootstrap();
+                                    bootstrap_done = true;
+                                }
+                            }
+
                             // Inform the GUI that this peer has been successfully validated.
                             output
                                 .send(Message::PeerValidated(addr_with_peer.to_string()))
@@ -194,9 +250,13 @@ pub fn network_worker() -> impl Stream<Item = Message> {
                                             break;
                                         },
                                     };
-                                    let dial = swarm.get_mut().dial(addr);
-                                    if let Err(e) = dial {
-                                        eprintln!("Dial error: {e}");
+                                    if dialed_addrs.insert(peer_multi_addr.clone()) {
+                                        let dial = swarm.get_mut().dial(addr);
+                                        if let Err(e) = dial {
+                                            eprintln!("Dial error: {e}");
+                                        }
+                                    } else {
+                                        println!("Already attempted dialing {peer_multi_addr}, skipping");
                                     }
                                 }
                                 _ => {}
@@ -208,4 +268,16 @@ pub fn network_worker() -> impl Stream<Item = Message> {
             }
         }
     })
+}
+
+/// Start the networking worker configured as a full node (participates fully
+/// in Kademlia routing and advertises itself as a full node).
+pub fn full_node_network_worker() -> impl Stream<Item = Message> {
+    network_worker(true)
+}
+
+/// Start the networking worker configured as a wallet-only node (does not
+/// advertise itself as capable of full sync).
+pub fn wallet_network_worker() -> impl Stream<Item = Message> {
+    network_worker(false)
 }

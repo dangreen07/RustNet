@@ -222,12 +222,17 @@ impl Storage {
         }
     }
 
-    pub fn get_best_height(&self) -> u64 {
+    /// Returns the current canonical tip hash.
+    pub fn best_tip_hash(&self) -> [u8; 32] {
+        self.best_tip
+    }
+
+    pub fn get_best_height(&self) -> Option<u64> {
         if let Ok(Some(bytes)) = self.db.get("best_height") {
             let arr: [u8; 8] = bytes.as_ref().try_into().unwrap();
-            u64::from_le_bytes(arr)
+            Some(u64::from_le_bytes(arr))
         } else {
-            return 0;
+            return None;
         }
     }
 
@@ -295,12 +300,90 @@ impl Storage {
         let _ = blocks.insert(current_hash_hex.clone(), block.encode());
         let _ = metadata.insert(current_hash_hex.as_bytes(), &new_height.to_le_bytes());
 
-        // Update best tip if this block makes a longer chain
-        if new_height > self.best_height {
+        // Update best tip if this block makes a longer chain OR this is the
+        // first (genesis) block being added.
+        if self.best_height == 0 || new_height > self.best_height {
             self.best_height = new_height;
             self.best_tip = block.current_hash;
             self.set_best_height();
             self.set_best_tip();
         }
+    }
+
+    /// Calculates the balance for the given compressed public key by walking
+    /// the canonical chain (the chain ending at `best_tip`). The balance is
+    /// the sum of all outputs directed to the key minus all inputs spent by
+    /// the key.
+    pub fn balance(&self, pubkey: [u8; 33]) -> f64 {
+        let blocks_tree = self.db.open_tree("blocks").unwrap();
+
+        let mut balance: f64 = 0.;
+
+        let mut current_hash = self.best_tip;
+
+        // Walk back to genesis
+        loop {
+            if current_hash == [0u8; 32] {
+                break;
+            }
+
+            let key = encode(current_hash);
+            let encoded_block = match blocks_tree.get(key).unwrap() {
+                Some(v) => v.to_vec(),
+                None => break, // corrupted db; bail
+            };
+
+            let block = Block::decode(&encoded_block);
+
+            // Process transactions
+            for tx in block.hashable_block.transactions.iter() {
+                // Outputs
+                for part in tx.details.outputs().iter() {
+                    if part.public_key() == pubkey {
+                        balance += part.amount();
+                    }
+                }
+                // Inputs
+                for part in tx.details.inputs().iter() {
+                    if part.public_key() == pubkey {
+                        balance -= part.amount();
+                    }
+                }
+            }
+
+            // Move to parent
+            current_hash = block.previous_hash();
+        }
+
+        if balance < 0. { 0. } else { balance as f64 }
+    }
+
+    /// Prints the canonical chain from best tip back to genesis for debugging.
+    pub fn print_chain(&self) {
+        let blocks_tree = self.db.open_tree("blocks").unwrap();
+
+        println!("=== Blockchain (best height: {}) ===", self.best_height);
+
+        let mut current_hash = self.best_tip;
+        let mut height = self.best_height as i64;
+
+        while current_hash != [0u8; 32] {
+            let hash_hex = encode(current_hash);
+            let encoded_block = match blocks_tree.get(&hash_hex).unwrap() {
+                Some(v) => v.to_vec(),
+                None => {
+                    println!("Missing block data for hash {hash_hex}");
+                    break;
+                }
+            };
+            let block = Block::decode(&encoded_block);
+            let tx_count = block.hashable_block.transactions.len();
+            println!("Height {height}: {hash_hex} | txs: {tx_count}");
+
+            current_hash = block.previous_hash();
+            height -= 1;
+        }
+
+        println!("=== End of chain ===");
     }
 }
