@@ -109,6 +109,18 @@ fn load_or_generate_identity() -> Keypair {
     kp
 }
 
+fn load_or_generate_listen_port() -> u16 {
+    // Try to read the port from config.json; fall back to 0 (let OS choose).
+    let cfg_value: Value = fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    if let Some(port) = cfg_value.get("node_listen_port").and_then(|v| v.as_u64()) {
+        return port as u16;
+    }
+    0
+}
+
 pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
     // Ensure a stable identity.
     let id_keys = load_or_generate_identity();
@@ -181,9 +193,9 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
             .unwrap()
             .build();
 
-        swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-            .unwrap();
+        let listen_port = load_or_generate_listen_port();
+        let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", listen_port).parse().unwrap();
+        swarm.listen_on(listen_addr).unwrap();
 
         let mut swarm = swarm.fuse();
         let mut receiver = receiver.fuse();
@@ -194,6 +206,19 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                     match swarm_event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             println!("Now listening on {address}");
+
+                            // Persist the listening TCP port in config.json so we reuse it next time.
+                            if let Some(tcp_port) = address.iter().find_map(|p| if let Protocol::Tcp(port) = p { Some(port) } else { None }) {
+                                use std::fs;
+                                let mut cfg_value: Value = fs::read_to_string("config.json")
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or_else(|| Value::Object(Default::default()));
+                                cfg_value["node_listen_port"] = serde_json::Value::from(tcp_port as u64);
+                                if let Ok(serialized) = serde_json::to_string(&cfg_value) {
+                                    let _ = fs::write("config.json", serialized);
+                                }
+                            }
 
                             // Forward only public addresses to GUI for display
                             let mut protocols = address.iter();

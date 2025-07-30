@@ -28,8 +28,11 @@ enum AppMode {
 #[derive(Serialize, Deserialize)]
 struct ConfigData {
     app_mode: AppMode,
-    private_key: String,
-    public_key: String,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
     discovered_peers: Vec<String>,
 }
 
@@ -616,22 +619,27 @@ impl State {
         let mut data: Vec<u8> = vec![];
         let _ = config_file.read_to_end(&mut data);
         let data = String::from_utf8(data).unwrap();
-        let config = serde_json::from_str::<ConfigData>(&data).unwrap();
+        let Ok(config) = serde_json::from_str::<ConfigData>(&data) else { return; };
         self.selected_mode = Some(config.app_mode);
-        let private_key = decode(config.private_key)
-            .unwrap()
-            .as_slice()
-            .try_into()
-            .unwrap();
-        let public_key = decode(config.public_key)
-            .unwrap()
-            .as_slice()
-            .try_into()
-            .unwrap();
-        self.wallet = Some(Wallet::from_keys(private_key, public_key));
+        // Attempt to restore wallet only if both keys are present and valid
+        if let (Some(priv_hex), Some(pub_hex)) = (config.private_key.as_ref(), config.public_key.as_ref()) {
+            if let (Ok(priv_vec), Ok(pub_vec)) = (decode(priv_hex), decode(pub_hex)) {
+                if priv_vec.len() == 32 && pub_vec.len() == 33 {
+                    if let (Ok(private_key), Ok(public_key)) = (
+                        priv_vec.as_slice().try_into(),
+                        pub_vec.as_slice().try_into(),
+                    ) {
+                        self.wallet = Some(Wallet::from_keys(private_key, public_key));
+                    }
+                }
+            }
+        }
         match config.app_mode {
-            AppMode::Wallet => {
+            AppMode::Wallet if self.wallet.is_some() => {
                 self.current_screen = Screen::WalletInfo;
+            }
+            AppMode::Wallet => {
+                self.current_screen = Screen::NoWallet;
             }
             AppMode::Node => {
                 self.current_screen = Screen::NodeSync;
