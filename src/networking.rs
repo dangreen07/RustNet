@@ -11,7 +11,9 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::gui::Message;
-use crate::protocol::{PROTO_ID, ProtoCodec, ProtocolMessage};
+use crate::protocol::{PROTO_ID, ProtoCodec, ProtocolMessage, MessageKind};
+use crate::blockchain::{Storage, Block};
+use libp2p::request_response::Message as ReqResMsg;
 use futures::{SinkExt, Stream, StreamExt, channel::mpsc};
 use iced::stream;
 use libp2p::{
@@ -130,6 +132,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
 
         let mut dialed_addrs: HashSet<String> = HashSet::new();
         let mut bootstrap_done = false;
+        let mut storage = Storage::new("rust_net_chain".to_string());
 
         // Create channel that external components can use to talk to the
         // networking task.
@@ -271,6 +274,12 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                 .send(Message::PeerValidated(addr_with_peer.to_string()))
                                 .await
                                 .ok();
+
+                            // Query the peer's tip so we can start syncing if we're behind.
+                            {
+                                let behaviour = swarm.get_mut().behaviour_mut();
+                                behaviour.req_res.send_request(&peer_id, ProtocolMessage::new(MessageKind::RequestTip));
+                            }
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             eprintln!("Failed to dial peer {peer_id:?}: {error}");
@@ -282,8 +291,56 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                             match event {
                                 MyBehaviourEvent::ReqRes(req_event) => {
                                     // TODO: Implement block / balance sync here.
-                                    if let RequestResponseEvent::Message { .. } = req_event {
-                                        // TODO: Handle actual request / response messages.
+                                    if let RequestResponseEvent::Message { peer, message } = req_event {
+                                        println!("Received message from {peer:?}: {message:?}");
+                                        match message {
+                                            ReqResMsg::Request { request, channel, .. } => {
+                                                match request.kind {
+                                                    MessageKind::RequestTip => {
+                                                        let best_height = storage.get_best_height().unwrap_or(0);
+                                                        let tip_hash = storage.best_tip_hash();
+                                                        let response = ProtocolMessage::new(MessageKind::RespondTip { best_height, tip_hash });
+                                                        let _ = swarm.get_mut().behaviour_mut().req_res.send_response(channel, response);
+                                                    }
+                                                    MessageKind::RequestBlocks { from_height, to_height } => {
+                                                        // Respect hard cap of 10 blocks per response.
+                                                        let capped_to = if to_height > from_height + 9 { from_height + 9 } else { to_height };
+                                                        if is_full_node {
+                                                            let blocks = storage.blocks_raw_range(from_height, capped_to);
+                                                            let response = ProtocolMessage::new(MessageKind::RespondBlocks { blocks });
+                                                            let _ = swarm.get_mut().behaviour_mut().req_res.send_response(channel, response);
+                                                        } else {
+                                                            // Wallet nodes don't provide blocks.
+                                                            let response = ProtocolMessage::new(MessageKind::RespondBlocks { blocks: Vec::new() });
+                                                            let _ = swarm.get_mut().behaviour_mut().req_res.send_response(channel, response);
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            ReqResMsg::Response { response, .. } => {
+                                                match response.kind {
+                                                    MessageKind::RespondTip { best_height, .. } => {
+                                                        let our_height = storage.get_best_height().unwrap_or(0);
+                                                        if best_height > our_height {
+                                                            let mut from = our_height + 1;
+                                                            while from <= best_height {
+                                                                let to = std::cmp::min(from + 9, best_height);
+                                                                swarm.get_mut().behaviour_mut().req_res.send_request(&peer, ProtocolMessage::new(MessageKind::RequestBlocks { from_height: from, to_height: to }));
+                                                                from = to + 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    MessageKind::RespondBlocks { blocks } => {
+                                                        for raw in blocks {
+                                                            let block = Block::decode(&raw);
+                                                            storage.add_new_block(block);
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}

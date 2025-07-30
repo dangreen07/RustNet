@@ -362,7 +362,11 @@ impl State {
                 let title = text("Node Sync").size(50);
 
                 let block_height_text = text("Block Height: ").size(30);
-                let height = self.blockchain.get_best_height().unwrap_or(0);
+                let height = self.blockchain.get_best_height();
+                let height = match height {
+                    Some(height) => height.to_string(),
+                    None => "No blocks found".to_string(),
+                };
                 let block_height = text(height).size(30);
                 let block_row = row![block_height_text, block_height];
 
@@ -395,7 +399,16 @@ impl State {
                 let mut peers_list = column![];
 
                 for addr in &self.all_peers.peers {
-                    peers_list = peers_list.push(text(addr));
+                    peers_list = peers_list.push(text_input("", &addr).style(
+                        |theme: &Theme, _status| text_input::Style {
+                            background: Background::Color(Color::TRANSPARENT),
+                            border: Border::default(),
+                            icon: Color::TRANSPARENT,
+                            placeholder: theme.palette().text,
+                            value: theme.palette().text,
+                            selection: theme.palette().primary,
+                        },
+                    ));
                 }
 
                 content = content
