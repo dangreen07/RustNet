@@ -1,12 +1,17 @@
 use hex::{decode as hex_decode, encode as hex_encode};
 use libp2p::identity::{self, Keypair};
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response::{
+    Behaviour as RequestResponse, Config as ReqResConfig, Event as RequestResponseEvent,
+    ProtocolSupport,
+};
 use serde_json::Value;
 use std::fs;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::gui::Message;
+use crate::protocol::{PROTO_ID, ProtoCodec, ProtocolMessage};
 use futures::{SinkExt, Stream, StreamExt, channel::mpsc};
 use iced::stream;
 use libp2p::{
@@ -37,6 +42,7 @@ enum MyBehaviourEvent {
     Kademlia,
     Identify,
     Ping,
+    ReqRes(RequestResponseEvent<ProtocolMessage, ProtocolMessage>),
 }
 
 // Implement `From` for each behaviour's event type to convert them
@@ -59,12 +65,19 @@ impl From<ping::Event> for MyBehaviourEvent {
     }
 }
 
+impl From<RequestResponseEvent<ProtocolMessage, ProtocolMessage>> for MyBehaviourEvent {
+    fn from(e: RequestResponseEvent<ProtocolMessage, ProtocolMessage>) -> Self {
+        MyBehaviourEvent::ReqRes(e)
+    }
+}
+
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "MyBehaviourEvent")]
 struct MyBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    req_res: RequestResponse<ProtoCodec>,
 }
 
 fn load_or_generate_identity() -> Keypair {
@@ -152,10 +165,17 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                 // 3. Ping setup (optional, for connection health)
                 let ping = ping::Behaviour::new(ping::Config::new());
 
+                let proto_behaviour = {
+                    let protocols = std::iter::once((PROTO_ID.to_string(), ProtocolSupport::Full));
+                    let cfg = ReqResConfig::default();
+                    RequestResponse::new(protocols, cfg)
+                };
+
                 MyBehaviour {
                     kademlia,
                     identify,
                     ping,
+                    req_res: proto_behaviour,
                 }
             })
             .unwrap()
@@ -232,6 +252,17 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             println!("Connection closed with peer {peer_id:?}");
+                        }
+                        SwarmEvent::Behaviour(event) => {
+                            match event {
+                                MyBehaviourEvent::ReqRes(req_event) => {
+                                    // TODO: Implement block / balance sync here.
+                                    if let RequestResponseEvent::Message { .. } = req_event {
+                                        // TODO: Handle actual request / response messages.
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }

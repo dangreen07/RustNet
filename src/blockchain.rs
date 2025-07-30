@@ -208,6 +208,16 @@ pub struct Storage {
     best_tip: [u8; 32],
 }
 
+impl Clone for Storage {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            best_height: self.best_height,
+            best_tip: self.best_tip,
+        }
+    }
+}
+
 impl Storage {
     pub fn new(db_name: String) -> Self {
         let mut db = sled::open(db_name).unwrap();
@@ -385,5 +395,25 @@ impl Storage {
         }
 
         println!("=== End of chain ===");
+    }
+
+    /// Raw, encoded blocks in `[from, to]` (inclusive)
+    pub fn blocks_raw_range(&self, from: u64, to: u64) -> Vec<Vec<u8>> {
+        let blocks = self.db.open_tree("blocks").unwrap();
+        let metadata = self.db.open_tree("block_meta").unwrap();
+
+        let mut out = vec![];
+        for item in metadata.iter().flatten() {
+            let (hash, height_bytes) = item;
+            let height = u64::from_le_bytes(height_bytes.as_ref().try_into().unwrap());
+            if (from..=to).contains(&height) {
+                if let Some(raw) = blocks.get(&hash).unwrap() {
+                    out.push(raw.to_vec());
+                }
+            }
+        }
+        // sort so the caller can append sequentially
+        out.sort_by_key(|raw| Block::decode(raw).previous_hash()); // deterministic
+        out
     }
 }
