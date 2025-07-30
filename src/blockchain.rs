@@ -3,6 +3,7 @@ use hex::encode;
 use sha2::{Digest, Sha256};
 
 use crate::wallet::{SignableTransaction, Transaction};
+use once_cell::sync::OnceCell;
 
 const HASH_TARGET: [u8; 32] = [
     0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
@@ -220,10 +221,11 @@ impl Clone for Storage {
 
 impl Storage {
     pub fn new(db_name: String) -> Self {
-        let mut db = sled::open(db_name).unwrap();
+        static DB_CELL: OnceCell<sled::Db> = OnceCell::new();
+        let db = DB_CELL.get_or_init(|| sled::open(&db_name).expect("Failed to open sled DB")).clone();
 
-        let best_height = Self::get_best_height_init(&mut db);
-        let best_tip = Self::get_best_tip_init(&mut db);
+        let best_height = Self::get_best_height_init(&db);
+        let best_tip = Self::get_best_tip_init(&db);
 
         Storage {
             db,
@@ -246,7 +248,7 @@ impl Storage {
         }
     }
 
-    fn get_best_height_init(db: &mut sled::Db) -> u64 {
+    fn get_best_height_init(db: & sled::Db) -> u64 {
         if let Ok(Some(bytes)) = db.get("best_height") {
             let arr: [u8; 8] = bytes.as_ref().try_into().unwrap();
             u64::from_le_bytes(arr)
@@ -264,7 +266,7 @@ impl Storage {
             .insert("best_height", &self.best_height.to_le_bytes());
     }
 
-    fn get_best_tip_init(db: &mut sled::Db) -> [u8; 32] {
+    fn get_best_tip_init(db: & sled::Db) -> [u8; 32] {
         if let Ok(Some(bytes)) = db.get("best_tip") {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
@@ -276,7 +278,7 @@ impl Storage {
         }
     }
 
-    fn set_best_tip(&mut self) {
+    fn set_best_tip(&self) {
         let _ = self.db.insert("best_tip", &self.best_tip);
     }
 

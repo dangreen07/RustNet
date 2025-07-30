@@ -5195,6 +5195,7 @@ dependencies = [
  "iced",
  "iced_futures",
  "libp2p",
+ "once_cell",
  "rsa",
  "secp256k1",
  "serde",
