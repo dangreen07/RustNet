@@ -64,6 +64,7 @@ pub struct State {
     current_screen: Screen,
     wallet_setup: WalletSetupState,
     all_peers: AllPeersState,
+    import_passphrase: String,
     /// Peers loaded from configuration that must be validated on startup before
     /// being persisted again. These are dialed once the networking subsystem
     /// exposes its sender, and only peers that successfully connect will be
@@ -87,6 +88,7 @@ impl Default for State {
                 copy_failed_feedback: None,
             },
             all_peers: AllPeersState::default(),
+            import_passphrase: "".to_string(),
             boot_peers: Vec::new(),
             network_tx: None,
             blockchain: chain,
@@ -105,6 +107,7 @@ impl Default for State {
 enum Screen {
     NoWallet,
     WalletCreated,
+    ImportWallet,
     SelectOption,
     WalletInfo,
     NodeSync,
@@ -130,6 +133,9 @@ pub enum Message {
     SelfAddress(String),
     PeerValidated(String),
     NetworkSender(mpsc::Sender<Message>),
+    ImportPassphraseChanged(String),
+    ImportWallet,
+    GoToImportWallet,
     GotoMain,
     GoToWalletInfo,
     GoToNodeSync,
@@ -191,9 +197,11 @@ impl State {
             Screen::NoWallet => {
                 // The buttons
                 let create_wallet = button("Create Wallet").on_press(Message::CreateWallet);
+                let import_wallet = button("Import Wallet").on_press(Message::GoToImportWallet);
 
                 // The layout
-                let interface = container(column![create_wallet])
+                let buttons_row = row![create_wallet, import_wallet].spacing(10);
+                let interface = container(column![buttons_row])
                     .center_x(Fill)
                     .center_y(Fill);
 
@@ -294,6 +302,24 @@ impl State {
                     .max_width(800);
 
                 let interface = container(main_column)
+                    .center(Fill)
+                    .padding(Padding::new(10.))
+                    .align_x(Center);
+
+                interface
+            }
+            Screen::ImportWallet => {
+                let instructions = text("Enter your 24-word passphrase").width(Fill).align_x(Center);
+
+                let passphrase_input = text_input("Enter your passphrase", &self.import_passphrase)
+                    .on_input(|value| Message::ImportPassphraseChanged(value))
+                    .width(Fill);
+
+                let import_button = button("Import Wallet").on_press(Message::ImportWallet);
+
+                let interface = container(column![instructions, passphrase_input, import_button]
+                    .spacing(5)
+                    .max_width(800))
                     .center(Fill)
                     .padding(Padding::new(10.))
                     .align_x(Center);
@@ -428,7 +454,7 @@ impl State {
         if self.selected_mode.is_some()
             && !matches!(
                 self.current_screen,
-                Screen::NoWallet | Screen::WalletCreated | Screen::SelectOption
+                Screen::NoWallet | Screen::WalletCreated | Screen::ImportWallet | Screen::SelectOption
             )
         {
             container(row![self.sidebar(), content])
@@ -448,6 +474,21 @@ impl State {
                 self.wallet = Some(wallet);
 
                 self.current_screen = Screen::WalletCreated;
+            }
+            Message::ImportPassphraseChanged(value) => {
+                self.import_passphrase = value;
+            }
+            Message::GoToImportWallet => {
+                self.current_screen = Screen::ImportWallet;
+            }
+            Message::ImportWallet => {
+                if !self.import_passphrase.trim().is_empty() {
+                    let passphrase = self.import_passphrase.clone();
+                    let wallet = Wallet::new(passphrase);
+                    self.wallet = Some(wallet);
+                    self.import_passphrase.clear();
+                    self.current_screen = Screen::SelectOption;
+                }
             }
             Message::CopyPassphrase => {
                 if let Ok(mut ctx) = ClipboardContext::new() {

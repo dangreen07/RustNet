@@ -253,10 +253,8 @@ impl Storage {
             let arr: [u8; 8] = bytes.as_ref().try_into().unwrap();
             u64::from_le_bytes(arr)
         } else {
-            // Initialise with 0 (no blocks yet)
-            let initial: u64 = 0;
-            let _ = db.insert("best_height", &initial.to_le_bytes());
-            initial
+            // No blocks yet; leave DB state untouched.
+            0
         }
     }
 
@@ -272,9 +270,7 @@ impl Storage {
             arr.copy_from_slice(&bytes);
             arr
         } else {
-            let arr = [0u8; 32];
-            let _ = db.insert("best_tip", &arr);
-            arr
+            [0u8; 32]
         }
     }
 

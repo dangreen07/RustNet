@@ -126,6 +126,8 @@ fn load_or_generate_listen_port() -> u16 {
 pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
     // Ensure a stable identity.
     let id_keys = load_or_generate_identity();
+    // Derive our PeerId once so we can avoid dialing ourselves.
+    let local_peer_id = PeerId::from(id_keys.public());
 
     stream::channel(100, move |mut output| async move {
         use std::collections::HashSet;
@@ -320,10 +322,24 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                             }
                                             ReqResMsg::Response { response, .. } => {
                                                 match response.kind {
-                                                    MessageKind::RespondTip { best_height, .. } => {
-                                                        let our_height = storage.get_best_height().unwrap_or(0);
-                                                        if best_height > our_height {
-                                                            let mut from = our_height + 1;
+                                                    MessageKind::RespondTip { best_height, tip_hash } => {
+                                                        let our_height_opt = storage.get_best_height();
+                                                        let our_height = our_height_opt.unwrap_or(0);
+                                                        let our_tip = storage.best_tip_hash();
+
+                                                        let behind = if best_height > our_height {
+                                                            true
+                                                        } else if best_height == our_height {
+                                                            // Same reported height, but we may still be missing the genesis block.
+                                                            // If our tip is the zero hash and the peer's tip is non-zero, we are behind.
+                                                            our_tip == [0u8; 32] && tip_hash != [0u8; 32]
+                                                        } else {
+                                                            false
+                                                        };
+
+                                                        if behind {
+                                                            // Determine the starting height: 0 if we have no blocks, otherwise next height.
+                                                            let mut from = if our_tip == [0u8; 32] { 0 } else { our_height + 1 };
                                                             while from <= best_height {
                                                                 let to = std::cmp::min(from + 9, best_height);
                                                                 swarm.get_mut().behaviour_mut().req_res.send_request(&peer, ProtocolMessage::new(MessageKind::RequestBlocks { from_height: from, to_height: to }));
@@ -355,6 +371,11 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                         Some(msg) => {
                             match msg {
                                 Message::NewPeer(peer_multi_addr) => {
+                                    // Skip if the address refers to ourselves (contains our peer id).
+                                    if peer_multi_addr.contains(&local_peer_id.to_string()) {
+                                        println!("Ignoring self-dial attempt: {peer_multi_addr}");
+                                        continue;
+                                    }
                                     let addr = peer_multi_addr.parse::<Multiaddr>();
                                     let addr = match addr {
                                         Ok(addr) => addr,
