@@ -2,9 +2,9 @@ use hex::{decode as hex_decode, encode as hex_encode};
 use libp2p::identity::{self, Keypair};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
-    Behaviour as RequestResponse, Config as ReqResConfig, Event as RequestResponseEvent,
-    ProtocolSupport,
-};
+     Behaviour as RequestResponse, Config as ReqResConfig, Event as RequestResponseEvent,
+     ProtocolSupport, OutboundFailure,
+ };
 use serde_json::Value;
 use std::fs;
 use std::net::IpAddr;
@@ -137,6 +137,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
         let mut bootstrap_done = false;
         let mut local_ips: HashSet<IpAddr> = HashSet::new();
         let mut tip_requested: HashSet<PeerId> = HashSet::new();
+        let mut connected_peers: HashSet<PeerId> = HashSet::new();
         let mut storage = Storage::new("rust_net_chain".to_string());
 
         // Create channel that external components can use to talk to the
@@ -178,7 +179,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                 let identify_cfg =
                     identify::Config::new("/rustnet/0.1.0".to_string(), local_key_pair.public())
                         .with_agent_version(agent_version.to_string())
-                        .with_interval(Duration::from_secs(300));
+                        .with_interval(Duration::from_secs(60));
 
                 let identify = identify::Behaviour::new(identify_cfg);
 
@@ -187,7 +188,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
 
                 let proto_behaviour = {
                     let protocols = std::iter::once((PROTO_ID.to_string(), ProtocolSupport::Full));
-                    let cfg = ReqResConfig::default();
+                    let cfg = ReqResConfig::default().with_request_timeout(Duration::from_secs(60));
                     RequestResponse::new(protocols, cfg)
                 };
 
@@ -259,6 +260,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                             }
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            connected_peers.insert(peer_id);
                             println!("Connection established with peer {peer_id}");
 
                             // Determine the remote multi-address that the connection was
@@ -303,6 +305,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                             eprintln!("Failed to dial peer {peer_id:?}: {error}");
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            connected_peers.remove(&peer_id);
                             println!("Connection closed with peer {peer_id:?}");
                         }
                         SwarmEvent::Behaviour(event) => {
@@ -344,6 +347,15 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                         RequestResponseEvent::Message { .. } => {},
                                         RequestResponseEvent::OutboundFailure { peer, error, request_id } => {
                                             eprintln!("ReqRes outbound failure to {:?}: {:?} (id {:?})", peer, error, request_id);
+                                            if let OutboundFailure::ConnectionClosed = error {
+                                                // Connection closed before we could send. Retry once on next available connection.
+                                                tip_requested.remove(peer);
+                                                if swarm.get_ref().is_connected(peer) {
+                                                    println!("Retrying RequestTip to {:?} on remaining connection", peer);
+                                                    swarm.get_mut().behaviour_mut().req_res.send_request(peer, ProtocolMessage::new(MessageKind::RequestTip));
+                                                    tip_requested.insert(*peer);
+                                                }
+                                            }
                                         }
                                         RequestResponseEvent::InboundFailure { peer, error, request_id } => {
                                             eprintln!("ReqRes inbound failure from {:?}: {:?} (id {:?})", peer, error, request_id);
@@ -427,7 +439,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                 }
                                 MyBehaviourEvent::Identify(identify_event) => {
                                     if let identify::Event::Received { peer_id, .. } = identify_event {
-                                        if tip_requested.insert(peer_id) {
+                                        if connected_peers.contains(&peer_id) && tip_requested.insert(peer_id) {
                                             println!("Identify received from {} - sending RequestTip", peer_id);
                                             let behaviour = swarm.get_mut().behaviour_mut();
                                             behaviour.req_res.send_request(&peer_id, ProtocolMessage::new(MessageKind::RequestTip));

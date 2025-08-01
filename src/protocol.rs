@@ -172,7 +172,7 @@ impl Codec for ProtoCodec {
         Box::pin(async move {
             let data = req.encode();
             let length = data.len() as u32;
-            let length: [u8; 4] = length.to_le_bytes();
+            let length: [u8; 4] = length.to_be_bytes();
             io.write_all(&length).await?;
             io.write_all(&data).await
         })
