@@ -41,7 +41,7 @@ fn is_public_ip(ip: &IpAddr) -> bool {
 }
 
 enum MyBehaviourEvent {
-    Kademlia,
+    Kademlia(kad::Event),
     Identify,
     Ping,
     ReqRes(RequestResponseEvent<ProtocolMessage, ProtocolMessage>),
@@ -50,8 +50,8 @@ enum MyBehaviourEvent {
 // Implement `From` for each behaviour's event type to convert them
 // into our custom `MyBehaviourEvent`.
 impl From<kad::Event> for MyBehaviourEvent {
-    fn from(_event: kad::Event) -> Self {
-        MyBehaviourEvent::Kademlia
+    fn from(event: kad::Event) -> Self {
+        MyBehaviourEvent::Kademlia(event)
     }
 }
 
@@ -291,6 +291,26 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                         }
                         SwarmEvent::Behaviour(event) => {
                             match event {
+                                MyBehaviourEvent::Kademlia(kad_event) => {
+                                    // When the routing table is updated with a new peer, attempt to connect.
+                                    if let kad::Event::RoutingUpdated { peer, addresses, .. } = kad_event {
+                                        if peer != local_peer_id {
+                                            for addr in addresses.iter() {
+                                                let mut addr_with_peer = addr.clone();
+                                                if !addr_with_peer.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+                                                    addr_with_peer.push(Protocol::P2p(peer.into()));
+                                                }
+                                                let addr_str = addr_with_peer.to_string();
+                                                if dialed_addrs.insert(addr_str.clone()) {
+                                                    if let Err(e) = swarm.get_mut().dial(addr_with_peer.clone()) {
+                                                        eprintln!("Dial error: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 MyBehaviourEvent::ReqRes(req_event) => {
                                     // TODO: Implement block / balance sync here.
                                     if let RequestResponseEvent::Message { peer, message } = req_event {
