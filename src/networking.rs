@@ -133,7 +133,9 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
         use std::collections::HashSet;
 
         let mut dialed_addrs: HashSet<String> = HashSet::new();
+        let mut dialed_peers: HashSet<PeerId> = HashSet::new();
         let mut bootstrap_done = false;
+        let mut local_ips: HashSet<IpAddr> = HashSet::new();
         let mut storage = Storage::new("rust_net_chain".to_string());
 
         // Create channel that external components can use to talk to the
@@ -211,6 +213,18 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                     match swarm_event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             println!("Now listening on {address}");
+                            // Record our own listening IPs so we don\'t later try to dial them.
+                            if let Some(ip) = address.iter().next() {
+                                match ip {
+                                    Protocol::Ip4(ip4) => {
+                                        local_ips.insert(IpAddr::V4(ip4));
+                                    }
+                                    Protocol::Ip6(ip6) => {
+                                        local_ips.insert(IpAddr::V6(ip6));
+                                    }
+                                    _ => {}
+                                }
+                            }
 
                             // Persist the listening TCP port in config.json so we reuse it next time.
                             if let Some(tcp_port) = address.iter().find_map(|p| if let Protocol::Tcp(port) = p { Some(port) } else { None }) {
@@ -264,7 +278,12 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                             // discover further peers automatically.
                             {
                                 let behaviour = swarm.get_mut().behaviour_mut();
-                                behaviour.kademlia.add_address(&peer_id, remote_addr.clone());
+                                // Only add the address to the DHT if **we** dialed the peer.  If the
+                                // peer dialed us, `send_back_addr` is just the transient socket the
+                                // peer used and is usually not a valid listening address.
+                                if matches!(endpoint, libp2p::core::ConnectedPoint::Dialer { .. }) {
+                                    behaviour.kademlia.add_address(&peer_id, remote_addr.clone());
+                                }
                                 if !bootstrap_done {
                                     let _ = behaviour.kademlia.bootstrap();
                                     bootstrap_done = true;
@@ -295,15 +314,27 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                     // When the routing table is updated with a new peer, attempt to connect.
                                     if let kad::Event::RoutingUpdated { peer, addresses, .. } = kad_event {
                                         if peer != local_peer_id {
-                                            for addr in addresses.iter() {
-                                                let mut addr_with_peer = addr.clone();
-                                                if !addr_with_peer.iter().any(|p| matches!(p, Protocol::P2p(_))) {
-                                                    addr_with_peer.push(Protocol::P2p(peer.into()));
-                                                }
-                                                let addr_str = addr_with_peer.to_string();
-                                                if dialed_addrs.insert(addr_str.clone()) {
-                                                    if let Err(e) = swarm.get_mut().dial(addr_with_peer.clone()) {
-                                                        eprintln!("Dial error: {e}");
+                                            // Only attempt to dial this peer once.
+                                            if dialed_peers.insert(peer) {
+                                                for addr in addresses.iter() {
+                                                    // Skip loopback and our own IPs.
+                                                    if addr.iter().any(|p| match p {
+                                                        Protocol::Ip4(ip4) => ip4.is_loopback() || local_ips.contains(&IpAddr::V4(ip4)),
+                                                        Protocol::Ip6(ip6) => ip6.is_loopback() || local_ips.contains(&IpAddr::V6(ip6)),
+                                                        _ => false,
+                                                    }) {
+                                                        continue;
+                                                    }
+
+                                                    let mut addr_with_peer = addr.clone();
+                                                    if !addr_with_peer.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+                                                        addr_with_peer.push(Protocol::P2p(peer.into()));
+                                                    }
+                                                    let addr_str = addr_with_peer.to_string();
+                                                    if dialed_addrs.insert(addr_str.clone()) {
+                                                        if let Err(e) = swarm.get_mut().dial(addr_with_peer.clone()) {
+                                                            eprintln!("Dial error: {e}");
+                                                        }
                                                     }
                                                 }
                                             }
@@ -404,14 +435,37 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                             break;
                                         },
                                     };
-                                    if dialed_addrs.insert(peer_multi_addr.clone()) {
-                                        let dial = swarm.get_mut().dial(addr);
-                                        if let Err(e) = dial {
-                                            eprintln!("Dial error: {e}");
-                                        }
-                                    } else {
-                                        println!("Already attempted dialing {peer_multi_addr}, skipping");
-                                    }
+                                                                // Parse peer id from the multiaddr if present so we can dedupe by peer.
+                            let maybe_pid = addr.iter().find_map(|p| {
+                                if let Protocol::P2p(pid) = p {
+                                    Some(pid.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(pid) = maybe_pid {
+                                if !dialed_peers.insert(pid) {
+                                    println!("Already dialed peer {pid}, skipping");
+                                    continue;
+                                }
+                            }
+                            if dialed_addrs.insert(peer_multi_addr.clone()) {
+                                // Skip loopback / self IPs.
+                                if addr.iter().any(|p| match p {
+                                    Protocol::Ip4(ip4) => ip4.is_loopback() || local_ips.contains(&IpAddr::V4(ip4)),
+                                    Protocol::Ip6(ip6) => ip6.is_loopback() || local_ips.contains(&IpAddr::V6(ip6)),
+                                    _ => false,
+                                }) {
+                                    println!("Skipping dial to local/loopback address {addr}");
+                                    continue;
+                                }
+                                let dial = swarm.get_mut().dial(addr);
+                                if let Err(e) = dial {
+                                    eprintln!("Dial error: {e}");
+                                }
+                            } else {
+                                println!("Already attempted dialing {peer_multi_addr}, skipping");
+                            }
                                 }
                                 _ => {}
                             }
