@@ -42,7 +42,7 @@ fn is_public_ip(ip: &IpAddr) -> bool {
 
 enum MyBehaviourEvent {
     Kademlia(kad::Event),
-    Identify,
+    Identify(identify::Event),
     Ping,
     ReqRes(RequestResponseEvent<ProtocolMessage, ProtocolMessage>),
 }
@@ -56,8 +56,8 @@ impl From<kad::Event> for MyBehaviourEvent {
 }
 
 impl From<identify::Event> for MyBehaviourEvent {
-    fn from(_event: identify::Event) -> Self {
-        MyBehaviourEvent::Identify
+    fn from(event: identify::Event) -> Self {
+        MyBehaviourEvent::Identify(event)
     }
 }
 
@@ -136,6 +136,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
         let mut dialed_peers: HashSet<PeerId> = HashSet::new();
         let mut bootstrap_done = false;
         let mut local_ips: HashSet<IpAddr> = HashSet::new();
+        let mut tip_requested: HashSet<PeerId> = HashSet::new();
         let mut storage = Storage::new("rust_net_chain".to_string());
 
         // Create channel that external components can use to talk to the
@@ -296,11 +297,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                 .await
                                 .ok();
 
-                            // Query the peer's tip so we can start syncing if we're behind.
-                            {
-                                let behaviour = swarm.get_mut().behaviour_mut();
-                                behaviour.req_res.send_request(&peer_id, ProtocolMessage::new(MessageKind::RequestTip));
-                            }
+                            
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             eprintln!("Failed to dial peer {peer_id:?}: {error}");
@@ -343,7 +340,19 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                 }
 
                                 MyBehaviourEvent::ReqRes(req_event) => {
-                                    // TODO: Implement block / balance sync here.
+                                    match &req_event {
+                                        RequestResponseEvent::Message { .. } => {},
+                                        RequestResponseEvent::OutboundFailure { peer, error, request_id } => {
+                                            eprintln!("ReqRes outbound failure to {:?}: {:?} (id {:?})", peer, error, request_id);
+                                        }
+                                        RequestResponseEvent::InboundFailure { peer, error, request_id } => {
+                                            eprintln!("ReqRes inbound failure from {:?}: {:?} (id {:?})", peer, error, request_id);
+                                        }
+                                        RequestResponseEvent::ResponseSent { peer, request_id } => {
+                                            println!("Response sent to {:?} id {:?}", peer, request_id);
+                                        }
+                                    }
+                                    // Handle message events
                                     if let RequestResponseEvent::Message { peer, message } = req_event {
                                         println!("Received message from {peer:?}: {message:?}");
                                         match message {
@@ -358,6 +367,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                                     MessageKind::RequestBlocks { from_height, to_height } => {
                                                         // Respect hard cap of 10 blocks per response.
                                                         let capped_to = if to_height > from_height + 9 { from_height + 9 } else { to_height };
+                                                        println!("Peer requested blocks {}..{} (capped {})", from_height, to_height, capped_to);
                                                         if is_full_node {
                                                             let blocks = storage.blocks_raw_range(from_height, capped_to);
                                                             let response = ProtocolMessage::new(MessageKind::RespondBlocks { blocks });
@@ -378,6 +388,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                                         let our_height = our_height_opt.unwrap_or(0);
                                                         let our_tip = storage.best_tip_hash();
 
+                                                        println!("RespondTip received: peer_height={} our_height={} peer_tip_zero={} our_tip_zero={}", best_height, our_height, tip_hash == [0u8; 32], our_tip == [0u8; 32]);
                                                         let behind = if best_height > our_height {
                                                             true
                                                         } else if best_height == our_height {
@@ -388,17 +399,21 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                                             false
                                                         };
 
+                                                        println!("Behind decision: {}", behind);
                                                         if behind {
                                                             // Determine the starting height: 0 if we have no blocks, otherwise next height.
                                                             let mut from = if our_tip == [0u8; 32] { 0 } else { our_height + 1 };
                                                             while from <= best_height {
                                                                 let to = std::cmp::min(from + 9, best_height);
+                                                                println!("Requesting blocks {}..{} from {:?}", from, to, peer);
                                                                 swarm.get_mut().behaviour_mut().req_res.send_request(&peer, ProtocolMessage::new(MessageKind::RequestBlocks { from_height: from, to_height: to }));
                                                                 from = to + 1;
                                                             }
                                                         }
                                                     }
                                                     MessageKind::RespondBlocks { blocks } => {
+                                                         println!("Received RespondBlocks containing {} block(s) from {:?}", blocks.len(), peer);
+
                                                         for raw in blocks {
                                                             let block = Block::decode(&raw);
                                                             storage.add_new_block(block);
@@ -410,12 +425,21 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                                         }
                                     }
                                 }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                                MyBehaviourEvent::Identify(identify_event) => {
+                                    if let identify::Event::Received { peer_id, .. } = identify_event {
+                                        if tip_requested.insert(peer_id) {
+                                            println!("Identify received from {} - sending RequestTip", peer_id);
+                                            let behaviour = swarm.get_mut().behaviour_mut();
+                                            behaviour.req_res.send_request(&peer_id, ProtocolMessage::new(MessageKind::RequestTip));
+                                        }
+                                    }
+                                }
+                                MyBehaviourEvent::Ping => {}
+                             }
+                         }
+                         _ => {}
+                     }
+                 }
 
                 msg = receiver.next() => {
                     match msg {

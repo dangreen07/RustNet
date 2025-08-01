@@ -308,6 +308,8 @@ impl Storage {
         let _ = blocks.insert(current_hash_hex.clone(), block.encode());
         let _ = metadata.insert(current_hash_hex.as_bytes(), &new_height.to_le_bytes());
 
+        println!("Stored block height {} hash {} (parent {})", new_height, encode(block.current_hash), encode(parent_hash));
+
         // Update best tip if this block makes a longer chain OR this is the
         // first (genesis) block being added.
         if self.best_height == 0 || new_height > self.best_height {
