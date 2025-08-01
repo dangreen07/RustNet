@@ -154,7 +154,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
             .with_tokio()
             .with_tcp(
                 Default::default(),
-                (libp2p::tls::Config::new, libp2p::noise::Config::new),
+                libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )
             .unwrap()
