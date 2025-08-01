@@ -400,18 +400,18 @@ impl Storage {
         let blocks = self.db.open_tree("blocks").unwrap();
         let metadata = self.db.open_tree("block_meta").unwrap();
 
-        let mut out = vec![];
+        let mut out: Vec<(u64, Vec<u8>)> = vec![];
         for item in metadata.iter().flatten() {
             let (hash, height_bytes) = item;
             let height = u64::from_le_bytes(height_bytes.as_ref().try_into().unwrap());
             if (from..=to).contains(&height) {
                 if let Some(raw) = blocks.get(&hash).unwrap() {
-                    out.push(raw.to_vec());
+                    out.push((height, raw.to_vec()));
                 }
             }
         }
-        // sort so the caller can append sequentially
-        out.sort_by_key(|raw| Block::decode(raw).previous_hash()); // deterministic
-        out
+        // Sort by height so parents always precede their children.
+        out.sort_by_key(|(h, _)| *h);
+        out.into_iter().map(|(_, raw)| raw).collect()
     }
 }
