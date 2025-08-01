@@ -1,3 +1,10 @@
+//! The graphical user interface (GUI) for the RustNet application.
+//!
+//! This module, built with the `iced` framework, provides the user with a visual
+//! interface for managing their wallet, interacting with the network, and
+//! monitoring the blockchain. It defines the application's state, messages,
+//! and the view logic for each screen.
+
 use bip39::{Language, Mnemonic};
 use copypasta::{ClipboardContext, ClipboardProvider};
 use futures::channel::mpsc;
@@ -18,6 +25,11 @@ use crate::blockchain::Storage;
 use crate::networking::{full_node_network_worker, wallet_network_worker};
 use crate::wallet::Wallet;
 
+/// Defines the operational mode of the application.
+///
+/// This enum allows the user to select whether they want to run a simple
+/// wallet, a full node that syncs the blockchain, or a miner that also
+/// participates in creating new blocks.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 enum AppMode {
     Wallet,
@@ -25,6 +37,10 @@ enum AppMode {
     Miner,
 }
 
+/// A structure for serializing and deserializing the application's configuration.
+///
+/// This is used to save and load user settings, including the selected app mode,
+/// wallet keys, and a list of discovered peers, to and from `config.json`.
 #[derive(Serialize, Deserialize)]
 struct ConfigData {
     app_mode: AppMode,
@@ -58,6 +74,11 @@ struct AllPeersState {
     input_value: String,
 }
 
+/// The main state for the entire GUI application.
+///
+/// This struct holds all the data necessary to render the user interface,
+/// including the current screen, wallet information, peer lists, and handles
+/// for communicating with the networking layer.
 pub struct State {
     wallet: Option<Wallet>,
     selected_mode: Option<AppMode>,
@@ -103,6 +124,9 @@ impl Default for State {
     }
 }
 
+/// An enum representing the different screens in the application.
+///
+/// This is used to control which view is currently displayed to the user.
 #[derive(Debug, Clone, Copy)]
 enum Screen {
     NoWallet,
@@ -115,6 +139,11 @@ enum Screen {
     AllPeers,
 }
 
+/// An enum of all possible messages that can be triggered by user interactions
+/// or asynchronous events.
+///
+/// These messages are processed by the `update` function to modify the application's
+/// state. This is the primary way that the GUI becomes interactive.
 #[derive(Debug, Clone)]
 pub enum Message {
     CreateWallet,
@@ -144,6 +173,7 @@ pub enum Message {
 }
 
 impl State {
+    /// Renders the sidebar navigation menu.
     fn sidebar(&self) -> Container<Message> {
         let mut buttons = column![].spacing(10);
 
@@ -192,6 +222,10 @@ impl State {
         container(buttons).padding(15).width(Length::Fixed(200.0))
     }
 
+    /// Renders the main view of the application based on the current state.
+    ///
+    /// This is the top-level rendering function that delegates to other functions
+    /// based on the `current_screen`.
     pub fn view(&self) -> Container<Message> {
         let content = match self.current_screen {
             Screen::NoWallet => {
@@ -463,6 +497,11 @@ impl State {
         }
     }
 
+    /// Handles all incoming messages and updates the application state accordingly.
+    ///
+    /// This function is the heart of the application's logic, processing user
+    /// input and other events to drive state changes. It can also return
+    /// a `Task` to perform asynchronous operations.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::CreateWallet => {
@@ -642,6 +681,7 @@ impl State {
         Task::none()
     }
 
+    /// Saves the current application configuration to `config.json`.
     fn save_config(&self) {
         if let Some(selected_mode) = &self.selected_mode {
             if let Some(wallet) = &self.wallet {
@@ -664,6 +704,7 @@ impl State {
         }
     }
 
+    /// Reads the application configuration from `config.json` and initializes the state.
     fn read_config(&mut self) {
         let config_file = File::open("config.json");
         let mut config_file = match config_file {
@@ -709,6 +750,10 @@ impl State {
         self.boot_peers = config.discovered_peers;
     }
 
+    /// Creates a subscription for timer-based events.
+    ///
+    /// This is used to create temporary UI effects, like the "Copied!"
+    /// feedback message, that disappear after a short duration.
     pub fn time_subscription(&self) -> Subscription<Message> {
         if self.wallet_setup.copy_feedback.is_some() {
             return time::every(Duration::from_millis(100)).map(move |_| Message::Tick);
@@ -716,6 +761,11 @@ impl State {
         Subscription::none()
     }
 
+    /// Creates a subscription to the networking worker.
+    ///
+    /// This function is what connects the GUI to the `libp2p` networking layer.
+    /// It starts the appropriate network worker based on the selected `AppMode`
+    /// and listens for `Message`s produced by it.
     pub fn networking_subscription(&self) -> Subscription<Message> {
         if matches!(self.selected_mode, Some(AppMode::Node | AppMode::Miner)) {
             Subscription::run(full_node_network_worker)

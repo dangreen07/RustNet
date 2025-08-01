@@ -1,34 +1,54 @@
+//! Defines the network communication protocol for RustNet.
+//!
+//! This module specifies the data structures and serialization formats for
+//! messages exchanged between peers. It includes message types for discovering
+//! peers, syncing the blockchain, and querying wallet balances. The protocol
+//! is designed to be extensible for future features.
+
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, io};
 use libp2p::request_response::Codec;
 use serde::{Deserialize, Serialize};
 
+/// The unique identifier for the RustNet blockchain protocol.
+/// This is used during the peer-to-peer negotiation phase to ensure that
+/// nodes are speaking the same protocol and version.
 pub const PROTO_ID: &str = "rustnet/blocks/1.0.0";
 
+/// Defines the different kinds of messages that can be sent between peers.
+///
+/// This enum is the core of the RustNet protocol, specifying all possible
+/// request and response types. Its structure allows for easy extension while
+/// maintaining backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageKind {
-    /// Ask a peer for its best block height and the corresponding tip hash.
+    /// A request to a peer for their current blockchain tip (best height and hash).
     RequestTip,
 
+    /// A response containing the peer's best block height and tip hash.
     RespondTip {
         best_height: u64,
         tip_hash: [u8; 32],
     },
 
+    /// A request for a range of blocks, identified by their heights.
     RequestBlocks {
         from_height: u64,
         to_height: u64,
     },
 
+    /// A response containing a vector of raw, encoded blocks.
     RespondBlocks {
         blocks: Vec<Vec<u8>>, // Raw encoded blocks
     },
 
+    /// A request for the balance of a specific public key.
     RequestBalance {
         /// Compressed SEC1 public key (33 bytes).  The vector **must** be 33
         /// bytes long; peers should reject requests with invalid lengths.
         public_key: Vec<u8>,
     },
 
+    /// A response containing the balance for the requested public key.
     RespondBalance {
         balance: f64,
     },
@@ -39,6 +59,10 @@ pub enum MessageKind {
     // ---------------------------------------------------------------------
 }
 
+/// A wrapper for all messages sent over the network.
+///
+/// This structure contains the protocol version and the specific message kind,
+/// ensuring that peers can handle different protocol versions gracefully.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolMessage {
     /// Protocol version understood by both peers.  Nodes **must** ignore
@@ -50,6 +74,7 @@ pub struct ProtocolMessage {
 }
 
 impl ProtocolMessage {
+    /// Creates a new `ProtocolMessage` with the current protocol version.
     #[inline]
     pub fn new(kind: MessageKind) -> Self {
         Self {
@@ -74,6 +99,11 @@ impl ProtocolMessage {
     }
 }
 
+/// A codec for the RustNet protocol that handles message encoding and decoding.
+///
+/// This implementation uses a simple length-prefixing format with a JSON payload.
+/// It is responsible for reading and writing `ProtocolMessage` structs from/to
+/// an underlying asynchronous I/O stream.
 #[derive(Clone, Default)]
 pub struct ProtoCodec;
 

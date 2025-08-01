@@ -1,3 +1,10 @@
+//! Core blockchain logic, including block structure, mining, and storage.
+//!
+//! This module defines the fundamental components of the blockchain itself.
+//! It handles the creation of blocks, the proof-of-work mining process,
+//! and the persistent storage of the blockchain on disk using a `sled` database.
+//! The storage is designed to support forks and identify the canonical chain.
+
 use chrono::{DateTime, Utc};
 use hex::encode;
 use sha2::{Digest, Sha256};
@@ -5,11 +12,18 @@ use sha2::{Digest, Sha256};
 use crate::wallet::{SignableTransaction, Transaction};
 use once_cell::sync::OnceCell;
 
+/// The proof-of-work target. A block hash must be less than or equal to this
+/// value to be considered valid.
 const HASH_TARGET: [u8; 32] = [
     0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
 ];
 
+/// A temporary, internal representation of a block used for hashing and mining.
+///
+/// This structure contains all the data that is hashed to form the block's
+/// unique identifier. It is distinct from the final `Block` struct to ensure
+/// that only the relevant data is included in the hash calculation.
 #[derive(Debug)]
 struct HashableBlock {
     hashed_transactions: Option<[u8; 32]>,
@@ -20,6 +34,7 @@ struct HashableBlock {
 }
 
 impl HashableBlock {
+    /// Creates a new `HashableBlock`.
     fn new(
         previous_hash: [u8; 32],
         transactions: Vec<Transaction>,
@@ -34,6 +49,7 @@ impl HashableBlock {
         }
     }
 
+    /// Computes and returns the Merkle root of the block's transactions.
     fn hash_transactions(&mut self) -> [u8; 32] {
         let mut transactions_buffer: Vec<u8> = vec![];
         for transaction in &self.transactions {
@@ -46,6 +62,7 @@ impl HashableBlock {
         return hashed_transactions;
     }
 
+    /// Serializes the block's header fields into a byte vector for hashing.
     fn create_hashable(&mut self) -> Vec<u8> {
         let mut hashable: Vec<u8> = vec![];
         hashable.extend_from_slice(&self.previous_hash);
@@ -62,6 +79,7 @@ impl HashableBlock {
         return hashable;
     }
 
+    /// Encodes the `HashableBlock` into a byte vector for storage or network transmission.
     fn encode(&self) -> Vec<u8> {
         let mut buffer: Vec<u8> = vec![];
         buffer.extend_from_slice(&self.previous_hash);
@@ -81,6 +99,7 @@ impl HashableBlock {
         return buffer;
     }
 
+    /// Decodes a `HashableBlock` from a byte slice.
     fn decode(data: &Vec<u8>) -> HashableBlock {
         let mut current_index = 0;
         let previous_hash: [u8; 32] = data[current_index..(current_index + 32)]
@@ -127,6 +146,11 @@ impl HashableBlock {
     }
 }
 
+/// Represents a single block in the blockchain.
+///
+/// A block consists of a header (contained in `hashable_block`) and the
+/// resulting `current_hash`, which is the proof-of-work solution. Blocks
+/// are chained together by referencing the hash of the previous block.
 #[derive(Debug)]
 pub struct Block {
     hashable_block: HashableBlock,
@@ -140,6 +164,10 @@ impl Block {
         self.hashable_block.previous_hash
     }
 
+    /// Mines a new block by finding a hash that meets the proof-of-work target.
+    ///
+    /// This is a computationally intensive process that involves repeatedly hashing
+    /// the block header with an incrementing nonce until a valid hash is found.
     pub fn mine(
         previous_hash: [u8; 32],
         transactions: Vec<Transaction>,
@@ -165,6 +193,7 @@ impl Block {
         }
     }
 
+    /// Encodes the full block (header and hash) into a byte vector.
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer: Vec<u8> = vec![];
         let hashable_bytes = &self.hashable_block.encode();
@@ -176,6 +205,7 @@ impl Block {
         return buffer;
     }
 
+    /// Decodes a full block from a byte slice.
     pub fn decode(data: &Vec<u8>) -> Block {
         let mut current_index = 0;
         let hashable_len: [u8; 8] = data[current_index..(current_index + 8)].try_into().unwrap();
@@ -220,6 +250,11 @@ impl Clone for Storage {
 }
 
 impl Storage {
+    /// Initializes a new or existing `sled` database for blockchain storage.
+    ///
+    /// The database is opened in a thread-safe manner using `OnceCell` to ensure
+    /// that only one instance is created. It also initializes the `best_height`
+    /// and `best_tip` from the database.
     pub fn new(db_name: String) -> Self {
         static DB_CELL: OnceCell<sled::Db> = OnceCell::new();
         let db = DB_CELL.get_or_init(|| sled::open(&db_name).expect("Failed to open sled DB")).clone();
@@ -239,6 +274,7 @@ impl Storage {
         self.best_tip
     }
 
+    /// Retrieves the height of the canonical chain's tip from the database.
     pub fn get_best_height(&self) -> Option<u64> {
         if let Ok(Some(bytes)) = self.db.get("best_height") {
             let arr: [u8; 8] = bytes.as_ref().try_into().unwrap();
@@ -248,6 +284,7 @@ impl Storage {
         }
     }
 
+    /// An internal helper to read the best height during storage initialization.
     fn get_best_height_init(db: & sled::Db) -> u64 {
         if let Ok(Some(bytes)) = db.get("best_height") {
             let arr: [u8; 8] = bytes.as_ref().try_into().unwrap();
@@ -258,12 +295,14 @@ impl Storage {
         }
     }
 
+    /// Writes the current best height to the database.
     fn set_best_height(&mut self) {
         let _ = self
             .db
             .insert("best_height", &self.best_height.to_le_bytes());
     }
 
+    /// An internal helper to read the best tip hash during storage initialization.
     fn get_best_tip_init(db: & sled::Db) -> [u8; 32] {
         if let Ok(Some(bytes)) = db.get("best_tip") {
             let mut arr = [0u8; 32];
@@ -274,10 +313,17 @@ impl Storage {
         }
     }
 
+    /// Writes the current best tip hash to the database.
     fn set_best_tip(&self) {
         let _ = self.db.insert("best_tip", &self.best_tip);
     }
 
+    /// Adds a new block to the storage.
+    ///
+    /// This function validates that the block's parent exists in the database
+    /// (unless it's a genesis block), calculates the block's height, and stores
+    /// both the block data and its metadata. If the new block extends the
+    /// canonical chain, it updates the `best_tip` and `best_height`.
     pub fn add_new_block(&mut self, block: Block) {
         let blocks = self.db.open_tree("blocks").unwrap();
         let metadata = self.db.open_tree("block_meta").unwrap(); // stores height for each block

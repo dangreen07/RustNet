@@ -1,3 +1,11 @@
+//! Manages all peer-to-peer networking using `libp2p`.
+//!
+//! This module is responsible for setting up the `libp2p` swarm, handling
+//! peer discovery through Kademlia, and managing request-response cycles
+//! for the custom protocol defined in `protocol.rs`. It distinguishes
+//! between full nodes and wallet-only nodes and handles the entire lifecycle
+//! of network events.
+
 use hex::{decode as hex_decode, encode as hex_encode};
 use libp2p::identity::{self, Keypair};
 use libp2p::multiaddr::Protocol;
@@ -23,6 +31,11 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 
+/// Checks if an `IpAddr` is a public, globally-routable address.
+///
+/// This function is used to filter out private, loopback, and link-local
+/// addresses to ensure that the node only advertises addresses that are
+/// reachable from the public internet.
 fn is_public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -40,6 +53,11 @@ fn is_public_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// An enum that aggregates events from all the different network behaviours.
+///
+/// This is a common pattern in `libp2p` to handle events from multiple
+/// behaviours in a single `match` statement. Each variant wraps the event
+/// type of a specific behaviour (e.g., Kademlia, Identify).
 enum MyBehaviourEvent {
     Kademlia(kad::Event),
     Identify(identify::Event),
@@ -73,6 +91,13 @@ impl From<RequestResponseEvent<ProtocolMessage, ProtocolMessage>> for MyBehaviou
     }
 }
 
+/// The main network behaviour struct for the `libp2p` swarm.
+///
+/// This struct combines several `libp2p` behaviours into a single logical unit.
+/// - `kademlia`: For peer discovery and routing.
+/// - `identify`: For exchanging peer information, like addresses and supported protocols.
+/// - `ping`: For checking connection liveness.
+/// - `req_res`: For handling the custom request-response protocol.
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "MyBehaviourEvent")]
 struct MyBehaviour {
@@ -82,6 +107,12 @@ struct MyBehaviour {
     req_res: RequestResponse<ProtoCodec>,
 }
 
+/// Loads the node's identity keypair from `config.json` or generates a new one.
+///
+/// A stable identity is crucial for a node's reputation and long-term
+/// participation in the network. This function ensures that the node uses
+/// the same `Keypair` across restarts, saving it to the configuration file
+/// if one doesn't already exist.
 fn load_or_generate_identity() -> Keypair {
     // Attempt to read `node_private_key` from config.json
     let mut cfg_value: Value = fs::read_to_string("config.json")
@@ -111,6 +142,10 @@ fn load_or_generate_identity() -> Keypair {
     kp
 }
 
+/// Loads the desired listening port from `config.json`, or returns 0 to let the OS choose.
+///
+/// Using a stable port helps peers reconnect to this node more reliably.
+/// If a port is used, it is saved back to the configuration file for future runs.
 fn load_or_generate_listen_port() -> u16 {
     // Try to read the port from config.json; fall back to 0 (let OS choose).
     let cfg_value: Value = fs::read_to_string("config.json")
@@ -123,6 +158,16 @@ fn load_or_generate_listen_port() -> u16 {
     0
 }
 
+/// The main asynchronous task that drives all networking operations.
+///
+/// This function sets up the `libp2p` swarm, initializes all required
+/// network behaviours, and enters a continuous loop to process incoming
+/// events from the swarm and from the GUI.
+///
+/// # Arguments
+///
+/// * `is_full_node` - A boolean indicating whether the node should operate as a
+///   full node (participating in routing and block storage) or a wallet-only node.
 pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
     // Ensure a stable identity.
     let id_keys = load_or_generate_identity();
@@ -261,6 +306,7 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             connected_peers.insert(peer_id);
+                            dialed_peers.insert(peer_id);
                             println!("Connection established with peer {peer_id}");
 
                             // Determine the remote multi-address that the connection was
@@ -514,14 +560,12 @@ pub fn network_worker(is_full_node: bool) -> impl Stream<Item = Message> {
     })
 }
 
-/// Start the networking worker configured as a full node (participates fully
-/// in Kademlia routing and advertises itself as a full node).
+/// A wrapper function to start the network worker in full-node mode.
 pub fn full_node_network_worker() -> impl Stream<Item = Message> {
     network_worker(true)
 }
 
-/// Start the networking worker configured as a wallet-only node (does not
-/// advertise itself as capable of full sync).
+/// A wrapper function to start the network worker in wallet-only mode.
 pub fn wallet_network_worker() -> impl Stream<Item = Message> {
     network_worker(false)
 }
